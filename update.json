@@ -1,6 +1,6 @@
 {
-  "versionCode": 3,
-  "versionName": "3.0.1",
+  "versionCode": 4,
+  "versionName": "3.0.2",
   "apkUrl": "https://github.com/hmjs2001/silky-camera-update/releases/download/v3.0.1/SkilyCamera.3.0.1.apk",
   "sizeBytes": 0,
   "changelog": "修复 vivo 专业模式慢快门黑屏\n变焦档位改为读取原厂镜头参数",
