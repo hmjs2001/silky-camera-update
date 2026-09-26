@@ -93,7 +93,7 @@ cd silky-camera
 
 ## 👤 作者
 
-**小码-初中**
+**hmjs**
 
 - B站 / 抖音：**小码-初中**
 - GitHub：[@hmjs2001](https://github.com/hmjs2001)
