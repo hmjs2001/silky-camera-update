@@ -1,8 +1,8 @@
 {
-  "versionCode": 7,
-  "versionName": "3.1.1",
-  "apkUrl": "https://github.com/hmjs2001/silky-camera-update/releases/download/v3.1.1/SkilyCamera.3.1.1.apk",
+  "versionCode": 8,
+  "versionName": "3.2.0",
+  "apkUrl": "https://github.com/hmjs2001/silky-camera-update/releases/download/v3.1.1/SkilyCamera.3.2.0.apk",
   "sizeBytes": 0,
-  "changelog": "关于页新增免责声明",
+  "changelog": "横屏布局全面重做：参数栏移到左侧，变焦、拍摄键、模式栏分列右侧\n修复小米10、小米13 Ultra、iQOO 15 Ultra 只能调用主摄、无法切换广角/长焦的问题\n50M 档位改为读取本机真实最大像素（50M/108M/200M）\n新增设置自动保存，退出后再次打开自动恢复上次状态\n新增自动旋转开关，可在参数栏手动开关\n修复视频模式下无法切换拍摄比例的问题\n视频模式默认不再开启防抖\n取景框比例跟随拍摄比例，所见即所得\n变焦切换动画改为先快后慢，手感更顺\n启动速度大幅优化，第二次打开跳过标定\n顶部按钮改为方块状，竖屏间距收紧",
   "force": false
 }
