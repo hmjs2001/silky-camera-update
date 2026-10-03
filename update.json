@@ -1,7 +1,7 @@
 {
   "versionCode": 9,
   "versionName": "3.2.1",
-  "apkUrl": "https://github.com/hmjs2001/silky-camera-update/releases/download/v3.2.1/SkilyCamera.3.2.1.apk",
+  "apkUrl": "https://github.com/hmjs2001/silky-camera-update/releases/",
   "sizeBytes": 0,
   "changelog": "修复真我 GT5 Pro / iQOO 10 Pro 无法调用长焦的问题\n修复已是最新版仍收到更新提示的问题\n关于页新增「版本码」显示，方便自查版本是否同步\n修复了横屏模式下专业模式的UI位置",
   "force": false
