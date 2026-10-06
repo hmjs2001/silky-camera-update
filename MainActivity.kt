@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
+import android.view.OrientationEventListener
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import java.util.concurrent.ConcurrentHashMap
@@ -26,6 +27,7 @@ import android.util.Range
 import android.util.Rational
 import android.util.Size
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -57,11 +59,13 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.Crossfade
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -86,23 +90,30 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.runtime.compositionLocalOf
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size as GeoSize
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Paint
@@ -125,6 +136,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
@@ -164,8 +176,6 @@ object DeviceCompatibility {
 
     /** 系统 API 级别。用字面量 36，避免依赖 Build.VERSION_CODES.BAKLAVA（需要 compileSdk 36 才有） */
     val apiLevel: Int get() = Build.VERSION.SDK_INT
-    val isAndroid14Plus: Boolean get() = apiLevel >= 34
-    val isAndroid15Plus: Boolean get() = apiLevel >= 35
     /** Android 16 = API 36。OriginOS 6 / HyperOS 3 / ColorOS 16 / MagicOS 10 都基于它 */
     val isAndroid16Plus: Boolean get() = apiLevel >= 36
 
@@ -194,8 +204,89 @@ object DeviceCompatibility {
     val isZte: Boolean
         get() = manufacturer.contains("zte") || brand.contains("zte") ||
                 brand.contains("nubia") || brand.contains("redmagic")
-    val isMeizu: Boolean
-        get() = manufacturer.contains("meizu") || brand.contains("meizu")
+
+    // ---------------- 本次新增：OPPO Find / 华为 P 系列 / 红米 Note ----------------
+
+    /**
+     * OPPO 内部代号格式判定：OPPO 的 DEVICE 字段是 "OP" + 4 位十六进制
+     * （Find X6 Pro = OP5A3D、Find X7 Ultra = OP5B3B、Find X8 Pro = OP5C7B …）。
+     * 只在已判定为 OPPO 系（isOppo）时才用，避免和其它品牌的 "opxx" 撞车。
+     */
+    private fun isOppoDeviceCode(dev: String): Boolean {
+        if (dev.length != 6) return false
+        if (!dev.startsWith("op", ignoreCase = true)) return false
+        val tail = dev.substring(2)
+        return tail.all { it.isDigit() || (it in 'a'..'f') || (it in 'A'..'F') }
+    }
+
+    /**
+     * OPPO Find 系列（Find X3 / X5 / X6 / X7 / X8 / Find N …）。
+     * MODEL 常见 "PHK110"、"CPH2557"、"Find X6"，DEVICE 常见 "OP5A3D" 之类。
+     *
+     * ⚠️ 这批机器的逻辑摄像头对第三方 App 只肯给主摄，潜望长焦（3x / 6x）必须物理直连，
+     *    否则点 3x 只是主摄裁切、画质很糊 —— 这就是"Find 调不了长焦"的来源。
+     */
+    val isOppoFindSeries: Boolean
+        get() = isOppo && (
+                // ① 机型名直接带 Find（"Find X6"、"Find X6 Pro"、"Find N3"…）
+                model.contains("find x") || model.contains("findx") ||
+                        model.contains("find n") || model.contains("findn") ||
+                        // ② OPPO 的机型号段：PHK / PHB / PHT / PHA …（Find X5~X9 各代都有）
+                        model.startsWith("phk") || model.startsWith("phb") ||
+                        model.startsWith("pht") || model.startsWith("pha") ||
+                        model.startsWith("phj") || model.startsWith("phz") ||
+                        // ③ 内部代号：OPPO 的 DEVICE 是 "OP" + 4 位十六进制（如 OP5A3D = Find X6 Pro）
+                        //    只认 isOppo 品牌下这个格式，不会误伤其它品牌
+                        isOppoDeviceCode(device) ||
+                        device.contains("find")
+                )
+
+    /**
+     * 一加（与 OPPO 同宗 HAL）。一加 11 / 12 / 13 的长焦在第三方 App 里同样常年切不动。
+     */
+    val isOnePlusTeleStubborn: Boolean
+        get() = isOnePlus && (model.contains("oneplus") || model.contains("op") || model.contains("kb"))
+
+    /**
+     * 华为 P40 / P40 Pro / P40 Pro+。
+     * DEVICE：P40=ANA-AN00(HWANA)、P40 Pro=ELS-AN00(HWELS)、P40 Pro+=VOG 系列。
+     * MODEL 常见 "ELS-AN00"、"ANA-AN00"、"ELS-NX9"、"HUAWEI P40 Pro"。
+     *
+     * ⚠️ 华为 P 系列两个已知问题：
+     *   ① 变焦按键与实际变焦不对应：逻辑头的 zoomRatio 域跟光学档位不是一回事，
+     *      必须"下发后回读真实倍率"再刷新 UI，不能只显示下发值。
+     *   ② 切到广角之后锁死在广角头：从广角切回 1x / 3x 时老代码判定"不需要换头"，
+     *      于是只用广角做数码裁切，看起来就是"只能调用广角、别的头调不出来"。
+     */
+    val isHuaweiP40: Boolean
+        get() = isHuawei && (
+                model.startsWith("els") || device.startsWith("els") ||
+                        model.startsWith("ana") || device.startsWith("ana") ||
+                        model.contains("p40") || device.contains("p40")
+                )
+
+    /** 华为 P 系列（P20 / P30 / P40 / P50 / P60 / P70…） */
+    val isHuaweiPSeries: Boolean
+        get() = isHuawei && (
+                isHuaweiP40 || model.contains("p30") || model.contains("p50") ||
+                        model.contains("p60") || model.contains("p70") || model.contains("p20")
+                )
+
+    /**
+     * 红米 Note 数字系列（Note 9 / 10 / 11 / 12 / 13 / 14 / 15 …）。
+     * 这些机器的逻辑摄像头 minZoomRatio 报 1.0，setZoomRatio(0.6) 被静默 clamp 回 1.0，
+     * 广角在第三方 App 里根本调不出来 —— 只能物理直连那颗超广角 id。
+     */
+    val isRedmiNoteSeries: Boolean
+        get() = (brand.contains("redmi") || model.startsWith("redmi")) && model.contains("note")
+
+    /**
+     * ★"广角直接走物理直连"的机型★
+     * 红米 Note 数字系列 / OPPO Find 系列实测：逻辑头 setZoomRatio(0.6) 完全无效，
+     * 与其浪费一次无效下发再校验，不如一开始就直连超广角物理头。
+     */
+    val preferPhysicalWide: Boolean
+        get() = isRedmiNoteSeries || isOppoFindSeries || isXiaomiMi10Series
 
     /**
      * vivo X80 Pro 识别。骁龙版常见 DEVICE=V2145A、天玑版 V2144A，部分批次 MODEL 才是 "X80 Pro"。
@@ -232,6 +323,43 @@ object DeviceCompatibility {
 
     /** iQOO 15 系列（含 Ultra） */
     val isIQOO15Series: Boolean get() = isIQOO15 || isIQOO15Ultra
+
+    /** realme / 真我。ColorOS 同宗，但品牌与型号段独立 */
+    val isRealme: Boolean
+        get() = manufacturer.contains("realme") || brand.contains("realme") ||
+                model.startsWith("rmx") || device.startsWith("rmx")
+
+    /**
+     * 真我 GT5 Pro：2023-11 发布，realme UI 5.0(Android 14) + 骁龙 8 Gen 3，型号 RMX3888。
+     * 三摄官方规格：主摄 LYT-808 23mm + 超广角 IMX355 16mm(112°) + 潜望 IMX890 65mm(36.4°)。
+     * 折算倍率 ≈ 0.7x / 1x / 2.8x，UI 档位按官方标称写 0.6 / 1 / 3。
+     * ⚠️ 它的逻辑摄像头在第三方 App 里只肯用主摄做数码裁切，长焦必须物理直连。
+     *    识别不到时看 logInfo() 打出来的 MODEL / DEVICE，再补一条 startWith 即可。
+     */
+    val isRealmeGT5Pro: Boolean
+        get() = isRealme && (
+                model.contains("gt5 pro") || model.contains("gt5pro") ||
+                        model.startsWith("rmx3888") || device.startsWith("rmx3888") ||
+                        model.startsWith("rmx3889") || device.startsWith("rmx3889")
+                )
+
+    /**
+     * iQOO 10 Pro：2022-07 发布，OriginOS(Android 12) + 骁龙 8+ Gen 1，型号 V2218A(海外 PD2218)。
+     * 三摄：主摄 50MP 23mm + 超广角 50MP 15mm(150°) + 长焦 14.6MP 69mm。
+     * 折算倍率 ≈ 0.65x / 1x / 3x（部分资料写 2.5x，以 dumpCameraInventory 的实测等效焦距为准）。
+     * ⚠️ 那颗长焦只有 14.6MP，主摄那套大 JPEG / 4K 分辨率它不接受，绑定必须能降级。
+     */
+    val isIQOO10Pro: Boolean
+        get() = isVivo && (
+                model.startsWith("v2218") || device.startsWith("v2218") ||
+                        model.startsWith("pd2218") || device.startsWith("pd2218") ||
+                        model.contains("iqqo 10 pro") || model.contains("iqqo10pro")
+                )
+
+    /** 已确认"逻辑头不切长焦、长焦必须物理直连"的机型 */
+    val isKnownTeleStubborn: Boolean
+        get() = isRealmeGT5Pro || isIQOO10Pro || isVivoX80Pro || isIQOO15Series ||
+                isOppoFindSeries || isOnePlusTeleStubborn || isHuaweiPSeries
 
     /**
      * 小米 10 系列。DEVICE（内部代号）：小米10=umi、10 Pro=cmi、10 至尊版=cas、10S=thyme。
@@ -273,7 +401,8 @@ object DeviceCompatibility {
      */
     val isStubbornMultiCam: Boolean
         get() = isXiaomiMi10Series || isXiaomi13Ultra || isXiaomiOneInch ||
-                isIQOO15Series || isVivoX80Pro
+                isIQOO15Series || isVivoX80Pro || isRealmeGT5Pro || isIQOO10Pro ||
+                isRedmiNoteSeries || isOppoFindSeries || isHuaweiPSeries
 
     /**
      * 出厂已知的光学档位，用于探测失败时兜底。
@@ -283,16 +412,25 @@ object DeviceCompatibility {
      */
     val knownOpticalStops: List<Float>
         get() = when {
+            isRealmeGT5Pro -> listOf(0.6f, 1.0f, 3.0f)   // 实测 16/23/65mm ≈ 0.7 / 1 / 2.8
+            isIQOO10Pro -> listOf(0.6f, 1.0f, 3.0f)      // 实测 15/23/69mm ≈ 0.65 / 1 / 3
             isIQOO15Series -> listOf(0.6f, 1.0f, 3.0f)
             isVivoX80Pro -> listOf(0.6f, 1.0f, 2.0f, 5.0f)
             isXiaomi13Ultra -> listOf(0.6f, 1.0f, 3.2f, 5.0f)
             isXiaomiOneInch -> listOf(0.6f, 1.0f, 3.2f, 5.0f)
             isXiaomiMi10Series -> listOf(0.6f, 1.0f, 2.0f)
+            // OPPO Find：超广角 + 主摄 + 潜望(3x)，Find X7 Ultra 还有 6x
+            isOppoFindSeries -> listOf(0.6f, 1.0f, 3.0f, 6.0f)
+            isOnePlusTeleStubborn -> listOf(0.6f, 1.0f, 3.0f)
+            // 华为 P40：3x 光学(80mm)；P40 Pro / Pro+：5x 潜望(125mm)
+            isHuaweiP40 -> if (model.contains("pro")) listOf(0.6f, 1.0f, 5.0f)
+            else listOf(0.6f, 1.0f, 3.0f)
+            // P50 Pro / P60 Pro：3.5x + 5x 两颗长焦
+            isHuaweiPSeries -> listOf(0.6f, 1.0f, 3.5f, 5.0f)
+            // 红米 Note 数字系列：超广角 + 主摄（多数没有独立长焦头）
+            isRedmiNoteSeries -> listOf(0.6f, 1.0f, 2.0f)
             else -> listOf(0.6f, 1.0f, 2.0f)
         }
-
-    /** 蔡司多摄机型：每颗焦段都是独立物理摄像头，切档需要更长收敛时间 */
-    val isZeissMultiCam: Boolean get() = isVivoX80Pro || isIQOO15Series
 
     // ---------------- ROM 识别 ----------------
 
@@ -414,6 +552,37 @@ object DeviceCompatibility {
             isXiaomi -> 500L
             else -> 400L
         }
+
+    /**
+     * 长焦头收敛等待(ms)。
+     * 潜望 / 长焦的对焦行程长，绑上来立刻下发 setZoomRatio 会被 HAL 吞掉，
+     * 表现就是"切到 3x 后画面还停在 1x"。比普通变焦多给 200~300ms。
+     */
+    val teleSettleDelayMs: Long
+        get() = when {
+            isAndroid16Plus -> 900L
+            isVivo -> 800L
+            isRealme || isOppo -> 750L
+            else -> 600L
+        }
+
+    /** >= 这个值才考虑"换一颗物理长焦头"（避免 1.2x 这种数码档也去抢主摄头） */
+    const val TELE_ENTER_RATIO = 1.8f
+    /** 已在长焦头上时，低于这个值才退回逻辑头。留 0.25 滞回，防止 3x 拖到 2.8x 就抖回主摄 */
+    const val TELE_EXIT_RATIO = 1.55f
+    /** 长焦直连连续失败多少次才真正禁用（1 = 一次就封，太激进；2 起才封） */
+    const val TELE_BIND_FAIL_LIMIT = 2
+
+    /**
+     * ★长焦头能"顺带"覆盖多少倍数码变焦★
+     *
+     * 单颗物理头自己的变焦范围很窄（很多长焦头本地只有 1.0~2.0x）。
+     * 所以直连某颗 Nx 的长焦头后，最多只能靠它再放大 [TELE_HEAD_ROOM] 倍；
+     * 超过这个倍数的目标必须回到逻辑摄像头走 setZoomRatio ——
+     * 否则就是拿一颗 3x 头去扛 10x（本地要 3.33x，头根本给不了），
+     * 表现正是"10x 切不过去 / 卡住不动"。
+     */
+    const val TELE_HEAD_ROOM = 2.5f
 
     /**
      * 标定用的单档等待(ms)。标定是"逐档试一遍"，档位越多越慢，
@@ -670,7 +839,11 @@ object DeviceCompatibility {
         val fovDeg: Float,          // 水平视场角
         val aperture: Float?,       // 光圈 F 值，读不到为 null
         val zoomFactor: Float,      // 相对主摄(≈24mm 等效)的倍率，即原厂 App 上显示的那个数字
-        val isOptical: Boolean = true
+        val isOptical: Boolean = true,
+        // ↓↓↓ 新增：这颗头能输出的最大 JPEG 尺寸（0 = 未探测到）。
+        // 物理直连长焦头时要用它兜底，否则拿主摄的尺寸去绑长焦头会必失败。
+        val maxJpegW: Int = 0,
+        val maxJpegH: Int = 0
     ) {
         val kind: LensKind
             get() = when {
@@ -881,6 +1054,75 @@ object DeviceCompatibility {
     }
 
     /**
+     * ★是否启用"CaptureRequest.PHYSICAL_CAMERA_ID 切换物理镜头"★
+     *
+     * 这条路不重新绑定相机（会话一直是逻辑摄像头），只是在每帧的 CaptureRequest 里
+     * 指定"用哪颗物理头出图"。好处：
+     *   · 不需要 cameraId 出现在 cameraIdList 里（ColorOS 的副摄只在 physicalCameraIds 下）
+     *   · 不 unbind/rebind → 预览不闪、画面比例不跳、录像不会被打断
+     *
+     * ⚠️ 关闭它就退回"重新绑定物理头"的老路。
+     */
+    const val USE_PHYSICAL_REQUEST_SWITCH = true
+
+    /**
+     * physicalCameraId → 它所属的【逻辑摄像头】id。
+     * 由 [probePhysicalCameras] 扫描 physicalCameraIds 时填入。
+     */
+    private val physicalOwner = HashMap<String, String>()
+
+    /** 这颗物理头挂在哪个逻辑摄像头下 */
+    fun ownerOfPhysical(id: String): String? = physicalOwner[id]
+
+    /**
+     * ★这颗头能不能用 CaptureRequest.PHYSICAL_CAMERA_ID 切换★
+     *
+     * 判定：它挂在某个逻辑头下（physicalCameraIds 里有），
+     * 但**不在 cameraIdList 里**（不能独立打开、CameraX 绑不上）。
+     * 两条同时成立才走这条路 —— 能独立打开的头继续走重新绑定的老路，
+     * 已经适配好的机型行为完全不变。
+     */
+    fun isSwitchableViaRequest(id: String): Boolean =
+        physicalOwner.containsKey(id) && !canBindDirectly(id)
+
+    /**
+     * ★CaptureRequest.PHYSICAL_CAMERA_ID 的 Key★
+     *
+     * ⚠️ 不能直接用 `CaptureRequest.PHYSICAL_CAMERA_ID` 静态常量：
+     *    这个 key 是 API 29 才加入的，compileSdk < 29 的项目会报 Unresolved reference。
+     *    改成运行时反射读取：
+     *      · 编译期不依赖 SDK 版本 → 任何 compileSdk 都能编过
+     *      · 运行时读不到（Android 9 及以下）→ 返回 null，自动退回"重新绑定物理头"的老路
+     */
+    @Suppress("UNCHECKED_CAST")
+    fun physicalCameraIdKey(): CaptureRequest.Key<String>? = try {
+        val f = CaptureRequest::class.java.getField("PHYSICAL_CAMERA_ID")
+        f.get(null) as? CaptureRequest.Key<String>
+    } catch (e: Exception) {
+        null
+    }
+
+    /**
+     * ★能【独立打开】的 cameraId 集合★
+     *
+     * 只遍历 cameraIdList 是不够的：ColorOS（OPPO Find X7 等）把长焦头挂在逻辑头的
+     * physicalCameraIds 下，而它本身不在 cameraIdList 里。
+     * 而 CameraX 的 CameraFilter 是按 Camera2CameraInfo.cameraId 匹配的，
+     * 它的候选集来自 cameraIdList —— 不在里面的 id 根本匹配不到，绑定必然失败。
+     *
+     * 所以分成两层：
+     *   · 知道有这颗头（physicalCameraIds）→ 用于识别倍率、算档位
+     *   · 能独立打开（cameraIdList）      → 才能走物理直连
+     *
+     * ⚠️ 必须放在 DeviceCompatibility 里：[probePhysicalCameras] 要用它，
+     *    而那个函数是 object 的成员，看不到 CameraApp 里的局部声明。
+     */
+    private var bindableIds: Set<String> = emptySet()
+
+    /** 这颗头能不能被 CameraX 独立绑定 */
+    fun canBindDirectly(id: String): Boolean = bindableIds.contains(id)
+
+    /**
      * 扫描本机【真实可绑定】的摄像头 id，返回可直接拿去 bindToLifecycle 的镜头列表。
      *
      * ★为什么需要第二个探测函数★
@@ -898,6 +1140,21 @@ object DeviceCompatibility {
             val manager = cameraManager(context)
             val found = ArrayList<LensProfile>()
 
+            // 先收集"待检查的 id"：
+            //   ① cameraIdList 里所有同朝向的（传统路径）
+            //   ② ★每颗逻辑头下挂的物理头★（physicalCameraIds，API 28+）
+            //
+            // ⚠️ ②是"OPPO Find X7 调不出长焦"的根因：
+            //    ColorOS 上后置长焦头往往【不在 cameraIdList 里】，只挂在逻辑头的
+            //    physicalCameraIds 下（cameraIdList 只有 "0" 后置逻辑 + "1" 前置逻辑）。
+            //    老代码只遍历 cameraIdList → 池里只有 1 颗后置头 →
+            //    requestLensSwitchIfNeeded 的 `pool.size < 2` 直接 return false，
+            //    换头逻辑从头到尾没机会执行。
+            //    （probeLenses 早就读了 physicalCameraIds，probePhysicalCameras 却漏了，
+            //     两边不一致 —— 所以"镜头参数里有长焦，可用池里却没有"。）
+            val idsToScan = LinkedHashSet<String>()
+            // ★记录"可独立打开"的 id★：CameraX 只能绑这些，其余的只用来识别倍率
+            bindableIds = manager.cameraIdList.toSet()
             for (id in manager.cameraIdList) {
                 val chars = try {
                     manager.getCameraCharacteristics(id)
@@ -905,24 +1162,66 @@ object DeviceCompatibility {
                     continue
                 }
                 if (chars.get(CameraCharacteristics.LENS_FACING) != lensFacing) continue
+                idsToScan.add(id)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    try {
+                        val phys = chars.physicalCameraIds
+                        if (!phys.isEmpty()) {
+                            Log.d("Camera", "逻辑头 $id 下挂物理头: ${phys.joinToString(",")}")
+                            idsToScan.addAll(phys)
+                            // ★记录归属★：这些头只能用 CaptureRequest.PHYSICAL_CAMERA_ID 切
+                            for (pid in phys) physicalOwner[pid] = id
+                        }
+                    } catch (e: Exception) {
+                        // 部分 ROM 这里会抛，忽略即可
+                    }
+                }
+            }
 
+            for (id in idsToScan) {
+                val chars = try {
+                    manager.getCameraCharacteristics(id)
+                } catch (e: Exception) {
+                    Log.w("Camera", "物理头 $id 读不到 CameraCharacteristics，跳过")
+                    continue
+                }
+                // physicalCameraIds 里的头不一定上报 LENS_FACING，
+                // 上报了且与目标朝向不符才过滤（没上报就按"属于这个逻辑头"处理）
+                val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                if (facing != null && facing != lensFacing) continue
+
+                // ★长焦头常见坑①：不上报焦距★
+                // vivo / realme 的部分物理头 LENS_INFO_AVAILABLE_FOCAL_LENGTHS 是 null 或 0，
+                // 老代码在这里 continue，长焦头直接从池里消失 —— 后面自然"调不出长焦"。
+                // 现在改成：焦距读不到也先收下（zoomFactor 记 0 = 待指派），
+                // 只要这颗头能出 JPEG 就认为它可绑（景深 / 微距这类辅助头才会被丢掉）。
                 val fl = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
                     ?.firstOrNull()
-                if (fl == null || fl <= 0f) continue
+                val cfg = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val jpegSizes = try {
+                    cfg?.getOutputSizes(ImageFormat.JPEG)?.toList()
+                } catch (e: Exception) {
+                    null
+                }
+                if ((fl == null || fl <= 0f) && jpegSizes.isNullOrEmpty()) continue
 
                 val phys = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
                 val sensorW: Float = phys?.width ?: 0f
-                val equiv: Float = if (sensorW > 0f) fl * 36f / sensorW else 0f
+                val equiv: Float =
+                    if (fl != null && fl > 0f && sensorW > 0f) fl * 36f / sensorW else 0f
+                val maxJ = jpegSizes?.maxByOrNull { it.width * it.height }
 
                 found.add(
                     LensProfile(
                         id = id,
-                        focalLengthMm = fl,
+                        focalLengthMm = fl ?: 0f,
                         sensorWidthMm = sensorW,
                         equiv35mm = equiv,
                         fovDeg = 0f,
                         aperture = null,
-                        zoomFactor = 0f
+                        zoomFactor = 0f,
+                        maxJpegW = maxJ?.width ?: 0,
+                        maxJpegH = maxJ?.height ?: 0
                     )
                 )
             }
@@ -948,22 +1247,142 @@ object DeviceCompatibility {
                 out.add(p.copy(equiv35mm = eq))
             }
             val base = out.minByOrNull { abs(it.equiv35mm - BASE_EQUIV_MM) } ?: out.first()
-            val sorted = out.map {
-                val factor = if (base.equiv35mm > 0f) it.equiv35mm / base.equiv35mm else 1f
-                it.copy(zoomFactor = snapToNiceStop(factor))
+            val mapped = out.map {
+                val factor = if (base.equiv35mm > 0f) it.equiv35mm / base.equiv35mm else 0f
+                it.copy(zoomFactor = if (factor > 0f) snapToNiceStop(factor) else 0f)
             }.sortedBy { it.zoomFactor }
+
+            // ★长焦头常见坑②：焦距读不到 → 倍率算不出来 → 池里少一颗头★
+            // 拿出厂档位兜底指派：主摄 / 超广角一般都会上报焦距，
+            // 所以未知的那颗基本就是长焦，把 knownOpticalStops 里没被占用的档位给它。
+            val sorted = reconcileStops(mapped)
 
             Log.d(
                 "Camera",
-                "★可绑定物理头★ " + sorted.joinToString(", ") { "${it.id}=${it.zoomFactor}x" } +
-                        "　（<1.0 的那颗就是超广角）"
+                "★物理头池★ " + sorted.joinToString(", ") {
+                    "${it.id}=${it.zoomFactor}x${if (canBindDirectly(it.id)) "" else "(仅识别)"}"
+                } + "　（<1.0 超广角，>1.8 长焦）"
             )
+            val cannotBind = sorted.filter { !canBindDirectly(it.id) }
+            if (cannotBind.isNotEmpty()) {
+                Log.w(
+                    "Camera",
+                    "以下头不在 cameraIdList 里，无法物理直连，只能靠逻辑头 setZoomRatio: " +
+                            cannotBind.joinToString(", ") { "${it.id}(${it.zoomFactor}x)" }
+                )
+            }
             if (sorted.isNotEmpty()) physicalProbeCache[lensFacing] = sorted
             sorted
         } catch (e: Exception) {
             Log.w("Camera", "物理头扫描失败", e)
             emptyList()
         }
+    }
+
+    /**
+     * 把"焦距没上报、倍率算不出来"的真实头按出厂档位补齐倍率。
+     * 主摄 / 超广角一般都会上报焦距，所以未知的那颗基本就是长焦 ——
+     * 不补齐的话它就以 0f 留在池里，换头逻辑永远不会挑中它。
+     */
+    private fun reconcileStops(list: List<LensProfile>): List<LensProfile> {
+        val unknown = list.filter { it.zoomFactor <= 0f }
+        if (unknown.isEmpty()) return list
+        val used = list.filter { it.zoomFactor > 0f }.map { it.zoomFactor }
+        val remain = knownOpticalStops.filter { k -> used.none { abs(it - k) < 0.05f } }
+        if (remain.isEmpty()) {
+            Log.w("Camera", "有 ${unknown.size} 颗头倍率未知且出厂档位已占满，按 1x 处理")
+            return list.map { if (it.zoomFactor <= 0f) it.copy(zoomFactor = 1f) else it }
+                .sortedBy { it.zoomFactor }
+        }
+        // 按 id 数字升序指派剩余档位（HAL 的 id 顺序基本就是 主摄 → 超广角 → 长焦）
+        val ordered = unknown.sortedBy { it.id.toIntOrNull() ?: Int.MAX_VALUE }
+        val assigned = ordered.mapIndexed { i, p ->
+            val z = remain.getOrElse(i) { remain.last() }
+            Log.w("Camera", "镜头 ${p.id} 未上报焦距，按出厂档位指派为 ${z}x")
+            p.copy(
+                zoomFactor = z,
+                equiv35mm = if (p.equiv35mm > 0f) p.equiv35mm else BASE_EQUIV_MM * z
+            )
+        }
+        return (list.filter { it.zoomFactor > 0f } + assigned).sortedBy { it.zoomFactor }
+    }
+
+    /**
+     * ★读取"原相机（原厂 App）焦段"★
+     *
+     * 两条路，取到就用、取不到就空着（调用方会退回 Camera2 实测焦距，不会因此崩）：
+     *   ① 系统属性：部分 ROM 把原厂焦段 / 变焦档位写在 ro.vendor.camera.*、vendor.camera.* 里
+     *   ② 厂商配置文件：/system/etc/camera、/vendor/etc/camera 下的 xml / cfg，
+     *      里面常有 "zoom_ratio"、"focal_length"、"ultra_wide" 之类的字段
+     *
+     * ⚠️ 全程 try/catch：Android 10+ 对 /vendor 的读取越来越严，读不到是常态，不影响其它逻辑。
+     */
+    private val VENDOR_CFG_DIRS = listOf(
+        "/system/etc/camera", "/vendor/etc/camera", "/odm/etc/camera",
+        "/system/etc", "/vendor/etc", "/my_product/etc/camera"
+    )
+
+    private val vendorStopsCache = ConcurrentHashMap<Int, List<Float>>()
+
+    fun readVendorZoomStops(lensFacing: Int): List<Float> {
+        vendorStopsCache[lensFacing]?.let { return it }
+        val out = LinkedHashSet<Float>()
+        try {
+            // ① 系统属性
+            for ((k, v) in systemProps) {
+                val key = k.lowercase()
+                if (!key.contains("camera")) continue
+                if (!(key.contains("zoom") || key.contains("focal") ||
+                            key.contains("lens") || key.contains("ratio"))
+                ) continue
+                val f = v.toFloatOrNull() ?: continue
+                if (f in 0.3f..30f) out.add(snapToNiceStop(f))
+            }
+            // ② 厂商配置文件
+            for (dir in VENDOR_CFG_DIRS) {
+                val d = java.io.File(dir)
+                if (!d.exists() || !d.isDirectory) continue
+                val files = d.listFiles() ?: continue
+                for (f in files) {
+                    if (!f.isFile) continue
+                    val n = f.name.lowercase()
+                    if (!(n.endsWith(".xml") || n.endsWith(".cfg") || n.endsWith(".ini") ||
+                                n.endsWith(".prop") || n.endsWith(".txt"))
+                    ) continue
+                    if (!(n.contains("camera") || n.contains("zoom") || n.contains("lens"))) continue
+                    try {
+                        // 只看前 400 行：焦段配置一般写在文件开头，避免读大文件拖慢启动
+                        val text = f.bufferedReader().use { r ->
+                            val sb = StringBuilder()
+                            var line = r.readLine()
+                            var count = 0
+                            while (line != null && count < 400) {
+                                sb.append(line).append('\n')
+                                line = r.readLine()
+                                count++
+                            }
+                            sb.toString()
+                        }
+                        val m = Regex("""(?:zoom|focal|ratio|factor)[^0-9-]{0,12}([0-9]{1,2}(?:\.[0-9]{1,2})?)""")
+                        for (mr in m.findAll(text)) {
+                            val v = mr.groupValues[1].toFloatOrNull() ?: continue
+                            if (v in 0.3f..30f) out.add(snapToNiceStop(v))
+                        }
+                    } catch (e: Exception) {
+                        // 单个文件读不动就算了
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("Camera", "读取原厂焦段失败（不影响主流程）", e)
+        }
+        // 至少保证 1x 存在；超过 6 个的多半是噪声
+        val list = out.filter { it > 0f }.sorted().take(6).ifEmpty { emptyList() }
+        if (list.isNotEmpty()) {
+            vendorStopsCache[lensFacing] = list
+            Log.d("Camera", "★原相机焦段★ ${list.joinToString("/")}")
+        }
+        return list
     }
 
     /** 虚拟镜头 id 前缀。带这个前缀的 id 不是真实 cameraId，不能拿去 bind */
@@ -1089,7 +1508,8 @@ object DeviceCompatibility {
             "Camera",
             "识别: vivo=$isVivo(iqoo=$isIQOO, iqoo15=$isIQOO15, x80pro=$isVivoX80Pro), " +
                     "xiaomi=$isXiaomi, huawei=$isHuawei, honor=$isHonor, " +
-                    "oppo=$isOppo(1+=$isOnePlus), samsung=$isSamsung, zte=$isZte"
+                    "oppo=$isOppo(1+=$isOnePlus, realme=$isRealme, gt5pro=$isRealmeGT5Pro), " +
+                    "iqoo10pro=$isIQOO10Pro, samsung=$isSamsung, zte=$isZte"
         )
         Log.d(
             "Camera",
@@ -1110,8 +1530,7 @@ object DeviceCompatibility {
 
 data class CapturedMedia(
     val uri: Uri,
-    val isVideo: Boolean,
-    val timestamp: Long
+    val isVideo: Boolean
 )
 
 enum class CaptureMode(val label: String) {
@@ -1121,18 +1540,70 @@ enum class CaptureMode(val label: String) {
 }
 
 /** 顶部工具栏的胶囊小按钮。selected=true 时高亮成橙色 */
+/**
+ * 顶部状态栏上的小按钮（像素 / 画质 / 帧率 / 防抖 / 比例）。
+ *
+ * ★改成方块状★ 以前用 18.dp 圆角（胶囊形），现在收到 6.dp ——
+ * 接近方形、只保留很小的圆角，看起来更硬朗，也不再像一颗颗圆形按键。
+ * 需要胶囊形时把 corner 传大一点即可。
+ *
+ * @param compact 紧凑模式：缩小内边距和字号，让方块更窄。
+ *   横屏左侧参数栏用它，避免黑边占掉太多横向空间、挤压取景框。
+ */
+/**
+ * ★通用按压反馈★：所有可点击控件统一用它做"按下缩小、松手弹回"。
+ *
+ * 用 spring（DampingRatioMediumBouncy）而不是 tween，手指抬起时有轻微回弹，
+ * 跟 iOS 控件的手感接近。enabled=false 时不缩放（灰掉的按钮不该有反馈）。
+ *
+ * 用法：Modifier.bouncyPress(interactionSource).clickable(interactionSource = ..., ...)
+ * ⚠️ 同一个 interactionSource 必须同时传给 bouncyPress 和 clickable，
+ *    否则 clickable 里的按压状态传不出来、动画不会触发。
+ */
 @Composable
-        /**
-         * 顶部状态栏上的小按钮（像素 / 画质 / 帧率 / 防抖 / 比例）。
-         *
-         * ★改成方块状★ 以前用 18.dp 圆角（胶囊形），现在收到 6.dp ——
-         * 接近方形、只保留很小的圆角，看起来更硬朗，也不再像一颗颗圆形按键。
-         * 需要胶囊形时把 corner 传大一点即可。
-         */
-        /**
-         * @param compact 紧凑模式：缩小内边距和字号，让方块更窄。
-         *   横屏左侧参数栏用它，避免黑边占掉太多横向空间、挤压取景框。
-         */
+private fun Modifier.bouncyPress(
+    interactionSource: MutableInteractionSource,
+    enabled: Boolean = true,
+    pressed: Float = 0.92f,
+    selected: Boolean = false,
+    selectedScale: Float = 1f
+): Modifier {
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val target = when {
+        !enabled -> 1f
+        isPressed -> pressed
+        selected -> selectedScale
+        else -> 1f
+    }
+    val scaleValue by animateFloatAsState(
+        targetValue = target,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMedium
+        ),
+        label = "bouncyPress"
+    )
+    // 局部变量改名成 scaleValue，就是为了不和 import 的 Modifier.scale 撞名，
+    // 这样 this.scale(...) 的解析毫无歧义（同名遮蔽是 Kotlin 里最容易踩的坑之一）
+    return this.scale(scaleValue)
+}
+
+/** 按压时的背景色高亮：从"常态色"过渡到"按下色"，比瞬间切换柔和 */
+@Composable
+private fun rememberPressColor(
+    interactionSource: MutableInteractionSource,
+    normal: Color,
+    pressedColor: Color
+): Color {
+    val isPressed by interactionSource.collectIsPressedAsState()
+    return animateColorAsState(
+        targetValue = if (isPressed) pressedColor else normal,
+        animationSpec = tween(durationMillis = 120),
+        label = "pressColor"
+    ).value
+}
+
+@Composable
 fun TopChip(
     text: String,
     selected: Boolean = false,
@@ -1147,14 +1618,25 @@ fun TopChip(
     val padH: Dp = if (compact) TOP_CHIP_PAD_H_COMPACT else 10.dp
     val padV: Dp = if (compact) TOP_CHIP_PAD_V_COMPACT else 6.dp
     val fs = if (compact) TOP_CHIP_FONT_COMPACT else 12.sp
+
+    // ★交互动画★：按下缩小到 0.90、松手弹回；底色也从常态色平滑过渡
+    val interactionSource = remember { MutableInteractionSource() }
+    val bgColor = rememberPressColor(
+        interactionSource = interactionSource,
+        normal = if (selected) Color(0xFFFFA000) else Color.Black.copy(alpha = 0.4f),
+        pressedColor = if (selected) Color(0xFFFFB300) else Color.White.copy(alpha = 0.18f)
+    )
+
     Box(
         modifier = modifier
+            .bouncyPress(interactionSource, pressed = 0.90f)
             .clip(shape)
-            .background(
-                if (selected) Color(0xFFFFA000) else Color.Black.copy(alpha = 0.4f)
-            )
+            .background(bgColor)
             .border(1.dp, Color.White.copy(alpha = 0.25f), shape)
-            .clickable { onClick() }
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null
+            ) { onClick() }
             .padding(horizontal = padH, vertical = padV),
         contentAlignment = Alignment.Center
     ) {
@@ -1163,10 +1645,198 @@ fun TopChip(
             color = if (selected) Color.Black else Color.White,
             fontSize = fs,
             fontWeight = FontWeight.Bold,
-            maxLines = 1
+            maxLines = 1,
+            // ★只旋转文字★：界面没跟着屏幕转时，把文字单独转正
+            modifier = Modifier.rotate(LocalLabelRotation.current)
         )
     }
 }
+
+/** 竖排滑条轨道的高度：竖着画就是为了让拖动行程够长，别再压扁 */
+private val PRO_SLIDER_VERTICAL_TRACK_H = 150.dp
+
+/**
+ * ★横屏是否重排成"左右分栏"★
+ * false = 横屏沿用竖屏布局，UI 不旋转，只把文字转正（本次需求）。
+ * true  = 恢复成以前的左右分栏（左侧设置栏 + 右侧控制栏）。
+ */
+private const val LANDSCAPE_RELAYOUT = false
+
+/**
+ * ★UI 锁定竖屏：屏幕转，UI 不转★
+ *
+ * true  = Activity 强制 PORTRAIT。手机横过来时界面完全不重排、不旋转，
+ *         整个竖屏界面侧躺在横屏屏幕上（左右正好填满，不会留黑边），
+ *         只有文字单独转正 —— 这就是"只旋转文字，不旋转 UI"。
+ * false = 界面跟随屏幕旋转（老行为）。
+ *
+ * ⚠️ 打开后设置栏里的"旋转"开关不再影响界面方向（界面恒定竖屏），
+ *    它只影响成片 EXIF 的方向记录。
+ */
+private const val LOCK_UI_PORTRAIT = true
+
+/**
+ * ★文字旋转方向修正★
+ * 不同机型传感器装向不同，如果实测发现文字转反了（倒着或反向 90°），
+ * 把这个值改成 1f 即可，不用动其它地方。
+ */
+private const val TEXT_ROTATION_SIGN = -1f
+
+/**
+ * 采样设备的物理旋转角（0 / 90 / 180 / 270），返回 Float 便于直接喂给 Modifier.rotate。
+ *
+ * 为什么用传感器而不是 Display.getRotation()：
+ *   UI 被锁定竖屏后，屏幕内容方向永远是 0，Display.getRotation() 读不到"手机真的横过来了"，
+ *   只有加速度传感器能拿到设备相对重力的真实姿态。
+ *
+ * 归一化到 90 的整数倍：手机拿在手里会微微晃，不归零的话文字会跟着抖。
+ */
+@Composable
+private fun rememberDeviceRotationDeg(context: Context): Float {
+    var deg by remember { mutableIntStateOf(0) }
+    DisposableEffect(context) {
+        val listener = object : OrientationEventListener(context) {
+            override fun onOrientationChanged(orientation: Int) {
+                // ORIENTATION_UNKNOWN = -1：设备平放或姿态不确定，保持上一次的值
+                if (orientation == ORIENTATION_UNKNOWN) return
+                val snapped = ((orientation + 45) / 90) * 90
+                deg = ((snapped % 360) + 360) % 360
+            }
+        }
+        if (listener.canDetectOrientation()) listener.enable()
+        onDispose { listener.disable() }
+    }
+    return deg.toFloat()
+}
+
+/** 物理头绑定后，等预览流起来的最长时间。超过就判定这次直连失败并回退 */
+private const val PHYSICAL_STREAM_TIMEOUT_MS = 2500L
+
+/**
+ * ★菜单高度上限★
+ * 菜单内容再多也不许超过这个值，超出部分纵向滚动。
+ * 之前是写死 300dp —— 屏幕矮的机器（横屏沿用竖屏布局时尤其明显）会被顶出屏幕。
+ */
+private const val MENU_MAX_HEIGHT_DP = 220f
+/** 菜单高度占屏幕高度的比例上限（跟上面的绝对值取小，双保险） */
+private const val MENU_MAX_HEIGHT_FRAC = 0.36f
+/** 菜单高度下限：哪怕屏幕再矮也保留这点空间，否则点不到项 */
+private const val MENU_MIN_HEIGHT_DP = 150f
+/** 竖屏时菜单距顶部的距离（要避开顶部设置栏那一排） */
+private const val MENU_TOP_PAD_PORTRAIT_DP = 52f
+/** 菜单距屏幕边缘的距离 */
+private const val MENU_SIDE_PAD_DP = 8f
+
+/**
+ * ★想要菜单出现在【用户看到的】哪个角★
+ *   0 = 左上    1 = 右上    2 = 左下    3 = 右下
+ * 直接写你想要的视觉位置，Compose 锚点由 [composeAnchorForVisual] 自动反推。
+ * 竖屏不受影响，恒为右上。
+ */
+private const val MENU_VISUAL_CORNER = 0
+
+/**
+ * ★坐标系旋转方向★：由一次实测**反推**出来，不是猜的。
+ *
+ * 界面被系统整体旋转着贴到屏幕上，"Compose 的角"和"用户看到的角"差一个 90° 旋转，
+ * 只有两种可能（见 [visualCornerOf]）。四个角在旋转下构成一个四循环，
+ * **知道任意一个角的像，整个映射就唯一确定**。
+ *
+ * 实测依据：菜单被 align 到 Compose BottomStart 时，实测出现在【视觉右下】。
+ *   -1（(u,v)→(v,-u)）预测 BottomStart → 右下 ✅ 符合
+ *   +1（(u,v)→(-v,u)）预测 BottomStart → 左上 ❌ 不符
+ * 故定为 -1。
+ *
+ * ⚠️ 只有当你机器上"下面那张表"整体对不上时才需要改它 —— 比如按当前设置
+ *    菜单没出现在左上角，而是跑到了右下角，就把它改成 +1。
+ */
+private const val MENU_ROT_DIR = -1
+
+/** 角落码 → Alignment。码的 bit0 = 靠右、bit1 = 靠下：0左上 1右上 2左下 3右下 */
+private fun alignmentOfCorner(code: Int): Alignment = when (code) {
+    0 -> Alignment.TopStart
+    1 -> Alignment.TopEnd
+    2 -> Alignment.BottomStart
+    else -> Alignment.BottomEnd
+}
+
+/**
+ * Compose 角落码 → 用户看到的角落码。
+ * 绕中心旋转 90° 只有两种方向，[MENU_ROT_DIR] 决定用哪一种：
+ *   -1: (u,v) → ( v, -u)   即 (bu,bv) → (bv, 1-bu)
+ *   +1: (u,v) → (-v,  u)   即 (bu,bv) → (1-bv, bu)
+ */
+private fun visualCornerOf(composeCode: Int): Int {
+    val bu = composeCode and 1
+    val bv = (composeCode shr 1) and 1
+    return if (MENU_ROT_DIR < 0) bv or ((1 - bu) shl 1)
+    else (1 - bv) or (bu shl 1)
+}
+
+/** 想让菜单出现在视觉某角 → 该把菜单 align 到 Compose 的哪个角 */
+private fun composeAnchorForVisual(visual: Int): Alignment {
+    for (c in 0..3) if (visualCornerOf(c) == visual) return alignmentOfCorner(c)
+    return Alignment.TopEnd
+}
+
+/**
+ * ★横屏菜单微调：按【视觉方向】写，不用管坐标系★
+ *
+ *   MENU_NUDGE_RIGHT_DP  正值 = 屏幕上向右挪（负值向左）
+ *   MENU_NUDGE_UP_DP     正值 = 屏幕上向上挪（负值向下）
+ *
+ * 直接按"屏幕上看到的方向"写，代码自动换算到 Compose 坐标系，
+ * 并且是在安全区【内部】偏移（BiasAlignment），所以永远不会被推出屏幕。
+ *
+ * 可调上限（由安全区余量决定，超出会被夹住）：
+ *   向右最多 (MENU_SAFE_BOX_DP - MENU_PANEL_MAX_H_DP) / 2 dp
+ *   向上最多 (MENU_SAFE_BOX_DP - MENU_PANEL_MAX_W_DP) / 2 dp
+ * 想挪得更远，加大 [MENU_SAFE_BOX_DP]。
+ */
+private const val MENU_NUDGE_RIGHT_DP = 20f
+private const val MENU_NUDGE_UP_DP = 42f
+
+/** 菜单面板自身尺寸上限：宽对应 widthIn(max)，高 = 内容上限 + 标题行 + 内边距 */
+private const val MENU_PANEL_MAX_W_DP = 220f
+private const val MENU_PANEL_MAX_H_DP = 280f
+
+/**
+ * ★旋转安全区边长★
+ * 横屏时菜单会整体旋转 90°，必须给它一个正方形容器兜住，否则会溢出屏幕。
+ *
+ * ⚠️ 这个值是"菜单能挪多远"的唯一来源，不只是防溢出：
+ *   安全区比菜单大出来的余量，就是菜单在角落里可自由挪动的空间。
+ *   余量 = (S - 菜单尺寸) / 2，且旋转后宽高互换 ——
+ *   所以【视觉左右】可调量取决于 (S - 菜单高)，【视觉上下】取决于 (S - 菜单宽)。
+ *
+ *   280 时左右余量只有 0dp（菜单高 280 已顶满），这就是之前"往右移不动"的原因。
+ *   320 → 左右余量 20dp、上下余量 50dp，够用。
+ * 想让菜单挪得更远就加大它，但别超过屏幕短边（代码里已按短边自动夹）。
+ */
+private const val MENU_SAFE_BOX_DP = 320f
+
+/**
+ * 等预览流真正起来。
+ *
+ * CameraX 的 PreviewView 会把预览流状态暴露成 IDLE / STREAMING ——
+ * 这是判断"到底有没有画面"最可靠的信号，比自己数帧或看 zoomState 准得多。
+ * 注意：绑上相机成功 ≠ 有画面，中间还隔着 surface 申请、HAL 出帧两步，
+ * 物理头（尤其超广角）在这两步上失败的机型不少。
+ */
+private suspend fun waitForPreviewStream(view: PreviewView, timeoutMs: Long): Boolean {
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (System.currentTimeMillis() < deadline) {
+        if (view.previewStreamState.value == PreviewView.StreamState.STREAMING) return true
+        delay(100)
+    }
+    return view.previewStreamState.value == PreviewView.StreamState.STREAMING
+}
+
+/**
+ * ★文字旋转角★：通过 CompositionLocal 下发，UI 上的文字按需取用。
+ * 默认是 0（不转）；只有界面没跟着屏幕转时才由外层设成 ±90。
+ */
+val LocalLabelRotation = compositionLocalOf { 0f }
 
 /** 顶部小按钮的圆角：6.dp ≈ 方块状（原来是 18.dp 的胶囊形） */
 private val TOP_CHIP_CORNER = 6.dp
@@ -1193,7 +1863,9 @@ private data class SettingsBarState(
     val videoStabilization: Boolean,
     val photoRatio: PhotoRatio,
     val flashMode: Int,
-    val autoRotate: Boolean
+    val autoRotate: Boolean,
+    /** 调色盘是否有色偏（用于在设置栏上点亮入口） */
+    val toneActive: Boolean = false
 )
 
 /** 参数栏用到的回调 */
@@ -1206,43 +1878,97 @@ private data class SettingsBarActions(
     val onPhotoRatioChange: (PhotoRatio) -> Unit,
     val onAutoRotateChange: (Boolean) -> Unit,
     val onFlashExpand: () -> Unit,
-    val onAbout: () -> Unit
+    val onAbout: () -> Unit,
+    /** 打开苹果风格调色盘 */
+    val onColorPalette: () -> Unit = {},
+    /** 打开多级菜单 */
+    val onMenu: () -> Unit = {}
 )
 
 /**
- * 参数栏的实际内容：像素 / 画质 / 帧率 / 防抖 / 比例 / 旋转 / 闪光 / 关于。
- * 不关心自己被横排还是竖排，由外层容器决定。
+ * ★状态栏按键的"规格"★
+ *
+ * 以前按键是写死在 [SettingsChipItems] 里的一串 TopChip，装不下就只能被挤出屏幕
+ * （录像模式那排尤其明显）。现在每个按键都描述成一份数据：
+ *   · 装得下 → 画成 chip
+ *   · 装不下 → 按 [menuEntries] 展开成菜单里的若干项
+ * 菜单按键 [CHIP_MENU] 永远保留，不参与溢出。
  */
-@Composable
-private fun SettingsChipItems(st: SettingsBarState, act: SettingsBarActions, compact: Boolean = false) {
-    // ── 像素按钮：只在【后置 + 拍照/专业模式】显示 ──
-    // 前置摄像头通常只有固定分辨率，切像素没意义还容易绑失败
+private data class ChipSpec(
+    val id: String,
+    /** chip 上显示的文字 */
+    val label: String,
+    val selected: Boolean = false,
+    val onClick: () -> Unit = {},
+    /** 溢出后在菜单里展开成的项 */
+    val menuEntries: List<MenuEntry> = emptyList()
+)
+
+/** 菜单里的一项（文字 / 是否选中 / 点击动作） */
+private data class MenuEntry(
+    val text: String,
+    val selected: Boolean = false,
+    val action: () -> Unit
+)
+
+// 按键 id：溢出判定和菜单回填都靠它对应
+private const val CHIP_HIGH_RES = "chip_high_res"
+private const val CHIP_QUALITY = "chip_quality"
+private const val CHIP_FPS = "chip_fps"
+private const val CHIP_STAB = "chip_stab"
+private const val CHIP_ROTATE = "chip_rotate"
+private const val CHIP_TONE = "chip_tone"
+private const val CHIP_MENU = "chip_menu"
+private const val CHIP_FLASH = "chip_flash"
+private fun ratioChipId(r: PhotoRatio): String = "chip_ratio_" + r.name
+
+/**
+ * 按当前状态生成状态栏按键列表。
+ * 纯函数（不依赖 Composition），所以设置栏和菜单两边调用得到的一定是同一份。
+ */
+private fun buildChipSpecs(
+    st: SettingsBarState,
+    act: SettingsBarActions
+): List<ChipSpec> {
+    val out = mutableListOf<ChipSpec>()
+
+    // ── 像素：只在【后置 + 拍照/专业模式】显示 ──
     if (!st.isFront && st.mode != CaptureMode.VIDEO) {
-        TopChip(
+        out += ChipSpec(
+            id = CHIP_HIGH_RES,
             // 显示本机真实最大像素，不再写死 5000 万
-            text = if (st.highResMode) st.highResLabel else "12M",
+            label = if (st.highResMode) st.highResLabel else "12M",
             selected = st.highResMode,
             onClick = {
                 act.onHaptic()
                 act.onHighResChange(!st.highResMode)
             },
-            compact = compact
+            menuEntries = listOf(
+                MenuEntry(
+                    if (st.highResMode) "高像素：开" else "高像素：关",
+                    st.highResMode
+                ) { act.onHighResChange(!st.highResMode) }
+            )
         )
     }
 
-    // ── 录像模式：用【画质】和【帧率】两个按钮替代像素按钮 ──
+    // ── 录像模式：画质 / 帧率 / 防抖 替代像素按钮 ──
     if (st.mode == CaptureMode.VIDEO) {
-        TopChip(
-            text = st.videoQuality.label,
+        out += ChipSpec(
+            id = CHIP_QUALITY,
+            label = st.videoQuality.label,
             onClick = {
                 act.onHaptic()
                 val vals = VideoQuality.values()
                 act.onVideoQualityChange(vals[(vals.indexOf(st.videoQuality) + 1) % vals.size])
             },
-            compact = compact
+            menuEntries = VideoQuality.values().map { q ->
+                MenuEntry("画质 ${q.label}", st.videoQuality == q) { act.onVideoQualityChange(q) }
+            }
         )
-        TopChip(
-            text = st.videoFrameRate.label,
+        out += ChipSpec(
+            id = CHIP_FPS,
+            label = st.videoFrameRate.label,
             selected = st.videoFrameRate == VideoFrameRate.FPS_60,
             onClick = {
                 act.onHaptic()
@@ -1251,83 +1977,207 @@ private fun SettingsChipItems(st: SettingsBarState, act: SettingsBarActions, com
                         VideoFrameRate.FPS_60 else VideoFrameRate.FPS_30
                 )
             },
-            compact = compact
+            menuEntries = VideoFrameRate.values().map { f ->
+                MenuEntry("帧率 ${f.label}", st.videoFrameRate == f) { act.onVideoFrameRateChange(f) }
+            }
         )
-        // 录像防抖。不再因 4K / 60帧 而隐藏——官方只是"不保证生效"，
-        // 实际多数机器照样有效。真正不支持的机器由 stabilizationSupported 判定。
-        TopChip(
-            text = "防抖",
+        out += ChipSpec(
+            id = CHIP_STAB,
+            label = "防抖",
             selected = st.videoStabilization,
             onClick = {
                 act.onHaptic()
                 act.onStabilizationChange(!st.videoStabilization)
             },
-            compact = compact
+            menuEntries = listOf(
+                MenuEntry("防抖", st.videoStabilization) {
+                    act.onStabilizationChange(!st.videoStabilization)
+                }
+            )
         )
     }
 
-    // ── 拍摄比例：3:4 / 16:9 / 全屏（录像模式下同样可以切换）──
+    // ── 拍摄比例：3:4 / 16:9 / 全屏 ──
     PhotoRatio.values().forEach { r ->
-        TopChip(
-            text = r.label,
+        out += ChipSpec(
+            id = ratioChipId(r),
+            label = r.label,
             selected = st.photoRatio == r,
             onClick = {
                 act.onHaptic()
                 if (st.photoRatio != r) act.onPhotoRatioChange(r)
             },
-            compact = compact
+            menuEntries = PhotoRatio.values().map { rr ->
+                MenuEntry("比例 ${rr.label}", st.photoRatio == rr) { act.onPhotoRatioChange(rr) }
+            }
         )
     }
 
-    // ── 自动旋转开关 ──
-    TopChip(
-        text = "旋转",
+    out += ChipSpec(
+        id = CHIP_ROTATE,
+        label = "旋转",
         selected = st.autoRotate,
         onClick = {
             act.onHaptic()
             act.onAutoRotateChange(!st.autoRotate)
         },
-        compact = compact
+        menuEntries = listOf(
+            MenuEntry("自动旋转", st.autoRotate) { act.onAutoRotateChange(!st.autoRotate) }
+        )
     )
 
-    // ── 闪光灯：常驻一个当前模式的图标，点击后展开选择面板 ──
-    Box(
-        modifier = Modifier
-            .size(if (compact) TOP_CHIP_ICON_COMPACT else 36.dp)
-            .clip(CircleShape)
-            .background(
-                if (st.flashMode == 3) Color(0xFFFFC107).copy(alpha = 0.9f)
-                else Color.Black.copy(alpha = 0.4f)
-            )
-            .border(1.dp, Color.White.copy(alpha = 0.25f), CircleShape)
-            .clickable {
-                act.onHaptic()
-                act.onFlashExpand()
-            },
-        contentAlignment = Alignment.Center
-    ) {
-        FlashIcon(mode = st.flashMode)
-    }
-
-    Box(
-        modifier = Modifier
-            .size(if (compact) TOP_CHIP_ICON_COMPACT else 36.dp)
-            .clip(CircleShape)
-            .background(Color.Black.copy(alpha = 0.4f))
-            .border(1.dp, Color.White.copy(alpha = 0.25f), CircleShape)
-            .clickable {
-                act.onHaptic()
-                act.onAbout()
-            },
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = "?",
-            color = Color.White,
-            fontSize = 16.sp,
-            fontWeight = FontWeight.Bold
+    out += ChipSpec(
+        id = CHIP_TONE,
+        label = "调色",
+        selected = st.toneActive,
+        onClick = {
+            act.onHaptic()
+            act.onColorPalette()
+        },
+        menuEntries = listOf(
+            MenuEntry("调色盘", st.toneActive) { act.onColorPalette() }
         )
+    )
+
+    // ── 多级菜单入口：永不溢出 ──
+    out += ChipSpec(
+        id = CHIP_MENU,
+        label = "菜单",
+        onClick = {
+            act.onHaptic()
+            act.onMenu()
+        }
+    )
+
+    // ── 闪光灯：图标按钮 ──
+    out += ChipSpec(
+        id = CHIP_FLASH,
+        label = "闪光",
+        selected = st.flashMode == 3,
+        onClick = {
+            act.onHaptic()
+            act.onFlashExpand()
+        },
+        menuEntries = listOf(
+            MenuEntry("闪光灯") { act.onFlashExpand() }
+        )
+    )
+    return out
+}
+
+/**
+ * 估算一个 chip 在"排布方向"上的尺寸：横排算宽度，竖排算高度。
+ *
+ * 不做真实测量是有原因的：设置栏在 [BoxWithConstraints] 里，真实测量要走
+ * SubcomposeLayout 两趟，代价高还容易在重组时抖动。而这里文字都是固定的中文/数字，
+ * 按"中日韩全角、其余约 0.58em"估算，误差不到 2dp，足够判断装不装得下。
+ */
+private fun estimateChipMain(label: String, compact: Boolean): Dp {
+    val fs = if (compact) TOP_CHIP_FONT_COMPACT.value else 12f
+    var text = 0f
+    for (c in label) {
+        // 0x2E80 以后基本是中日韩字符，按一个字宽算；其余（数字/字母）按 0.58em
+        text += if (c.code > 0x2E80) fs else fs * 0.58f
     }
+    return if (compact) {
+        // 竖排：主方向是高度 = 上下内边距 + 一行字高
+        (TOP_CHIP_PAD_V_COMPACT.value * 2f + fs * 1.35f + 2f).dp
+    } else {
+        // 横排：主方向是宽度 = 左右内边距 + 文字宽
+        (10f * 2f + text + 2f).dp
+    }
+}
+
+/**
+ * ★溢出判定★：按 [specs] 的顺序累加尺寸，超出 [available] 的挪进菜单。
+ * 菜单键 [CHIP_MENU] 强制保留（否则整个菜单入口都没了），其余按先后顺序溢出。
+ */
+private fun computeHiddenChips(
+    specs: List<ChipSpec>,
+    available: Dp,
+    gap: Dp,
+    compact: Boolean
+): Set<String> {
+    if (available <= 0.dp) return emptySet()
+    val hidden = mutableSetOf<String>()
+    // 先给菜单键留位置
+    var used = estimateChipMain("菜单", compact)
+    for (spec in specs) {
+        if (spec.id == CHIP_MENU) continue
+        val need = when {
+            // 闪光是圆形图标，尺寸固定
+            spec.id == CHIP_FLASH -> if (compact) TOP_CHIP_ICON_COMPACT else 36.dp
+            else -> estimateChipMain(spec.label, compact)
+        }
+        val next = used + gap + need
+        if (next <= available) used = next else hidden.add(spec.id)
+    }
+    return hidden.toSet()
+}
+
+/**
+ * 设置栏按键的实际渲染。
+ *
+ * ★自动适配★：装不下的按键（菜单键除外）由 [computeHiddenChips] 判定后不再画 chip，
+ * 而是按 [ChipSpec.menuEntries] 在菜单里出现，所以功能一个都不会丢，只是换了入口。
+ */
+@Composable
+private fun SettingsChipItems(
+    specs: List<ChipSpec>,
+    st: SettingsBarState,
+    act: SettingsBarActions,
+    compact: Boolean = false,
+    hidden: Set<String> = emptySet()
+) {
+    specs.forEach { spec ->
+        when {
+            // ★菜单键永远保留★：它是所有溢出项的唯一入口，不能被溢出掉
+            spec.id == CHIP_MENU -> {
+                TopChip(
+                    text = spec.label,
+                    selected = false,
+                    onClick = spec.onClick,
+                    compact = compact
+                )
+            }
+            spec.id == CHIP_FLASH -> {
+                if (spec.id in hidden) return@forEach
+                // ★交互动画★：与 TopChip 同一套按压反馈
+                val flashSource = remember { MutableInteractionSource() }
+                Box(
+                    modifier = Modifier
+                        .bouncyPress(flashSource, pressed = 0.88f)
+                        .size(if (compact) TOP_CHIP_ICON_COMPACT else 36.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (st.flashMode == 3) Color(0xFFFFC107).copy(alpha = 0.9f)
+                            else Color.Black.copy(alpha = 0.4f)
+                        )
+                        .border(1.dp, Color.White.copy(alpha = 0.25f), CircleShape)
+                        .clickable(
+                            interactionSource = flashSource,
+                            indication = null
+                        ) {
+                            act.onHaptic()
+                            act.onFlashExpand()
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    FlashIcon(mode = st.flashMode)
+                }
+            }
+            else -> {
+                if (spec.id in hidden) return@forEach
+                TopChip(
+                    text = spec.label,
+                    selected = spec.selected,
+                    onClick = spec.onClick,
+                    compact = compact
+                )
+            }
+        }
+    }
+    // ★关于已移入"菜单 → 关于"★：设置栏上不再常驻"?"按钮
 }
 
 /** 竖屏：参数栏横着排在顶部 */
@@ -1335,14 +2185,21 @@ private fun SettingsChipItems(st: SettingsBarState, act: SettingsBarActions, com
 private fun SettingsChipsRow(
     modifier: Modifier = Modifier,
     st: SettingsBarState,
-    act: SettingsBarActions
+    act: SettingsBarActions,
+    hidden: Set<String> = emptySet(),
+    onHiddenChange: (Set<String>) -> Unit = {}
 ) {
-    Row(
-        modifier = modifier,
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(TOP_BAR_GAP_PORTRAIT)
-    ) {
-        SettingsChipItems(st, act, compact = false)
+    val specs = buildChipSpecs(st, act)
+    BoxWithConstraints(modifier = modifier) {
+        // 用真实可用宽度判定：装不下的按键交给菜单
+        val shouldHide = computeHiddenChips(specs, maxWidth, TOP_BAR_GAP_PORTRAIT, false)
+        LaunchedEffect(shouldHide) { onHiddenChange(shouldHide) }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(TOP_BAR_GAP_PORTRAIT)
+        ) {
+            SettingsChipItems(specs, st, act, compact = false, hidden = hidden)
+        }
     }
 }
 
@@ -1351,25 +2208,23 @@ private fun SettingsChipsRow(
 private fun SettingsChipsColumn(
     modifier: Modifier = Modifier,
     st: SettingsBarState,
-    act: SettingsBarActions
+    act: SettingsBarActions,
+    hidden: Set<String> = emptySet(),
+    onHiddenChange: (Set<String>) -> Unit = {}
 ) {
-    Column(
-        modifier = modifier,
-        // 竖排时用 6.dp，配合紧凑方块，整条栏更窄、给取景框让出空间
-        verticalArrangement = Arrangement.spacedBy(6.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        SettingsChipItems(st, act, compact = true)
+    val specs = buildChipSpecs(st, act)
+    BoxWithConstraints(modifier = modifier) {
+        // 竖排：可用高度就是这一栏的最大高度，间隔 6.dp
+        val gap = 6.dp
+        val shouldHide = computeHiddenChips(specs, maxHeight, gap, true)
+        LaunchedEffect(shouldHide) { onHiddenChange(shouldHide) }
+        Column(
+            verticalArrangement = Arrangement.spacedBy(gap),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            SettingsChipItems(specs, st, act, compact = true, hidden = hidden)
+        }
     }
-}
-
-/** 闪光灯模式对应的文字标签（无障碍/日志用） */
-fun flashLabel(mode: Int): String = when (mode) {
-    0 -> "关闭"
-    1 -> "自动"
-    2 -> "开启"
-    3 -> "手电"
-    else -> "关闭"
 }
 
 /**
@@ -1490,6 +2345,12 @@ data class CameraSettings(
     val proEv: Int = 0,
     val proFocus: Float = -1f,
     val proWb: Int = 0,
+    /** 苹果风格调色盘：色温，负=偏冷 正=偏暖（-100 ~ 100） */
+    val toneWarmth: Float = 0f,
+    /** 苹果风格调色盘：色调，负=偏绿 正=偏洋红（-100 ~ 100） */
+    val toneTint: Float = 0f,
+    /** 调色强度（0 ~ 100），0 = 关闭 */
+    val toneIntensity: Float = 100f,
     /**
      * 变焦标定表（全局倍率 → linearZoom）。
      * ★性能优化的关键★：标定要逐档下发倍率再轮询 zoomState，通常要 1~2 秒，
@@ -1529,6 +2390,9 @@ object SettingsStore {
     private const val K_EV = "pro_ev"
     private const val K_FOCUS = "pro_focus"
     private const val K_WB = "pro_wb"
+    private const val K_TONE_W = "tone_warmth"
+    private const val K_TONE_T = "tone_tint"
+    private const val K_TONE_I = "tone_intensity"
 
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -1597,7 +2461,10 @@ object SettingsStore {
                 proShutterNs = p.getLong(K_SHUTTER, 0L),
                 proEv = p.getInt(K_EV, 0),
                 proFocus = p.getFloat(K_FOCUS, -1f),
-                proWb = p.getInt(K_WB, 0)
+                proWb = p.getInt(K_WB, 0),
+                toneWarmth = p.getFloat(K_TONE_W, 0f),
+                toneTint = p.getFloat(K_TONE_T, 0f),
+                toneIntensity = p.getFloat(K_TONE_I, 100f)
             ).also {
                 Log.d(
                     "Settings",
@@ -1629,6 +2496,9 @@ object SettingsStore {
                 .putInt(K_EV, s.proEv)
                 .putFloat(K_FOCUS, s.proFocus)
                 .putInt(K_WB, s.proWb)
+                .putFloat(K_TONE_W, s.toneWarmth)
+                .putFloat(K_TONE_T, s.toneTint)
+                .putFloat(K_TONE_I, s.toneIntensity)
                 .apply()
             // 标定表单独维护：普通设置保存时不覆盖它
             if (s.linearMap.isNotEmpty()) encodeLinearMap(s.linearMap)?.let {
@@ -1647,6 +2517,26 @@ object SettingsStore {
  * 不兜底的话所有变焦档位都会被过滤掉，连数码裁切都用不了。
  */
 private const val FALLBACK_MAX_ZOOM = 8.0f
+
+/**
+ * ★照片模式的数码变焦上限 = 50x★
+ * HAL 通常只上报 10x / 20x / 30x，超过它 CameraX 会把 zoomRatio clamp 回去。
+ * 所以这里拆成两段：
+ *   · HAL 上限以内 → 正常 setZoomRatio（画质最好）
+ *   · HAL 上限以外 → 预览缩放 + 拍照时按同比例中心裁切（扩展数码变焦）
+ * 这样"最高 50x"在任何机器上都能点到，且预览与成片一致。
+ */
+private const val MAX_PHOTO_ZOOM = 50.0f
+
+/**
+ * ★录像模式的数码变焦上限 = 15x★
+ * 视频实时编码，数码变焦再往上画质崩得厉害，而且视频没法像照片那样后期裁切，
+ * 所以直接按 15x 截断（HAL 上限更低时以 HAL 为准）。
+ */
+private const val MAX_VIDEO_ZOOM = 15.0f
+
+/** 预览 / 拍照时的目标帧率。锁成 30-30 让 AE 不再拖帧，预览更稳、也减少拖影噪点 */
+private const val DEFAULT_PREVIEW_FPS = 30
 
 /** 手动曝光时帧时长相对曝光时间留出的余量（ns），1ms。vivo / 天玑 HAL 要求 frame >= exposure */
 private const val FRAME_OVERHEAD_NS = 1_000_000L
@@ -1732,6 +2622,12 @@ private const val ZOOM_UI_REFRESH_MS = 72L
  */
 private const val STAB_RESTORE_DELAY_MS = 150L
 
+/** 录制中恢复防抖前的等待：编码器也在跑，给足时间，避免恢复的瞬间又顿一下 */
+private const val STAB_RESTORE_DELAY_MS_REC = 600L
+
+/** 录制中把倍率刷新放宽到 ~8fps，把主线程让给编码器（性能优化） */
+private const val ZOOM_UI_REFRESH_MS_REC = 120L
+
 /**
  * 拖动变焦的下发节流间隔(ms)。
  * detectTransformGestures 是按【指针事件】回调的，一秒能来 100+ 次，
@@ -1743,10 +2639,21 @@ private const val DRAG_ZOOM_THROTTLE_STAB_MS = 120L
 private const val DRAG_ZOOM_THROTTLE_REC_MS = 150L
 
 /**
- * 关于页展示的版本号。发新版时改这一处即可（两处显示都用它）。
- * 注意：更新检查判断用的是 build.gradle 里的 versionCode，跟这个字符串无关。
+ * ★版本号 / 版本码★
+ *
+ * ⚠️ 这里的 APP_VERSION_CODE 必须 >= 服务器 update.json 里的 versionCode，
+ *    否则"已是最新版"的判断会反过来，每次启动都提示更新（见 AboutScreen 里的说明）。
+ * 发新版时改这两处，并且【记得同步 app/build.gradle 里的 versionName / versionCode】。
  */
-private const val APP_VERSION_NAME = "3.1.1"
+private const val APP_VERSION_NAME = "v3.2.5"
+private const val APP_VERSION_CODE = 10
+
+/**
+ * ★应用显示名★
+ * 关于页顶部那一行。改这一处即可，不用去 strings.xml。
+ * ⚠️ 桌面图标下面显示的名字在 AndroidManifest.xml / strings.xml 里，跟这个不是一回事。
+ */
+private const val APP_DISPLAY_NAME = "SilkyCamera"
 
 // ==================== 版本更新检查 ====================
 
@@ -1795,8 +2702,9 @@ object AppUpdate {
                 info.versionCode.toLong()
             }
         } catch (e: Exception) {
-            Log.w("Update", "读取当前版本失败", e)
-            0L
+            // 读不到就用代码里的兜底值，至少不会误判成"有更新"
+            Log.w("Update", "读取当前版本失败，用代码内的版本码兜底", e)
+            APP_VERSION_CODE.toLong()
         }
     }
 
@@ -1847,6 +2755,11 @@ object AppUpdate {
                 Log.w("Update", "版本文件字段不合法: $body")
                 return@withContext null
             }
+            Log.d(
+                "Update",
+                "版本文件: versionCode=${info.versionCode}, versionName=${info.versionName}, " +
+                        "apkUrl=${info.apkUrl}"
+            )
             info
         } catch (e: Exception) {
             Log.w("Update", "检查更新失败（已忽略）", e)
@@ -1978,10 +2891,15 @@ class MainActivity : ComponentActivity() {
             window.isStatusBarContrastEnforced = false
         }
 
-        // ★自动旋转★ 默认让屏幕方向跟随传感器（忽略系统"方向锁定"）。
-        // 相机会横竖屏换布局，如果被系统锁定在竖屏，横屏布局就永远用不上。
-        // 用户在设置栏里关掉"旋转"后，改回跟随系统设置（UNSPECIFIED）。
-        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+        // 界面方向。
+        // ★UI 锁定竖屏★ 打开 LOCK_UI_PORTRAIT 后恒定竖屏：手机横过来界面不转、不重排，
+        // 只有文字转正（角度由 CameraApp 里的传感器采样算出）。
+        // 关掉就恢复成跟随传感器，由设置栏的"旋转"开关决定跟系统还是跟重力。
+        requestedOrientation = if (LOCK_UI_PORTRAIT) {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+        }
 
         setContent {
             MaterialTheme {
@@ -2003,6 +2921,56 @@ fun CameraApp() {
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
 
+    /**
+     * ★横屏：只旋转文字，不重排 UI★
+     *
+     * UI 布局恒定走竖屏那套（顶部设置栏、底部模式栏 + 快门组），横屏也不改成左右分栏。
+     * 想恢复以前的左右分栏，把 [LANDSCAPE_RELAYOUT] 改回 true 即可 —— 所有布局分支
+     * 读的都是这个变量，一处开关全量生效。
+     */
+    val relayoutLandscape = isLandscape && LANDSCAPE_RELAYOUT
+
+    /**
+     * ★文字补偿旋转角★
+     *
+     * UI 被锁成竖屏后，它不再跟着屏幕转 —— 手机横过来时整个竖屏界面侧躺在屏幕上，
+     * 文字也跟着侧躺。这里给文字一个反向旋转，让它重新正过来。
+     *
+     * 角度取设备物理旋转角的相反数：OrientationEventListener 报 90 表示设备顺时针转了 90°，
+     * 界面也就顺时针侧躺 90°，所以文字要逆时针转 90° 才正。
+     * 设备没转时是 0，等于不动，零副作用。
+     */
+    val deviceRotationDeg = rememberDeviceRotationDeg(context)
+    val labelRotationDeg = if (LOCK_UI_PORTRAIT) {
+        TEXT_ROTATION_SIGN * deviceRotationDeg
+    } else 0f
+
+    /**
+     * ★文字旋转动画★
+     * 手机转动时角度会从 0 直接跳到 ±90，不加动画的话文字是"啪"地一下翻过来，很生硬。
+     *
+     * 另外做了【最短路径归一化】：直接对 0→270 做插值会绕一大圈（270°），
+     * 归一化到 -180~180 之后就是 -90°，走的是最短的那一侧，转起来才自然。
+     */
+    val shortestLabelRotation: Float = labelRotationDeg.let {
+        var d = it % 360f
+        if (d > 180f) d -= 360f
+        if (d < -180f) d += 360f
+        d
+    }
+    val labelRotationAnim by animateFloatAsState(
+        targetValue = shortestLabelRotation,
+        animationSpec = tween(durationMillis = 300, easing = FastOutSlowInEasing),
+        label = "labelRotation"
+    )
+
+    /**
+     * ★竖向空间紧张★：横屏但沿用竖屏布局时，屏幕高度只有竖屏时的一半多点，
+     * 底部那一坨（变焦轮盘 + 模式栏 + 快门）按竖屏的间距会顶出屏幕。
+     * 这里统一把各处 padding / 间距收紧一档。
+     */
+    val uiCompact = isLandscape && !LANDSCAPE_RELAYOUT
+
     // ── 设置持久化 ──
     // 启动后先从 SharedPreferences 恢复上次退出时的设置，settingsLoaded 置 true 才允许绑定相机。
     // 不这么做会先用默认值绑一次、恢复完再重绑，白白黑屏两下。
@@ -2020,6 +2988,24 @@ fun CameraApp() {
     // 小米 / iQOO 上逻辑摄像头的 zoomState 常只报 min=1.0，setZoomRatio(0.6) 被 clamp 回 1.0，
     // 超广角永远切不过去。这时改为直接绑定那颗物理摄像头，等于原厂 App 的"切镜头"。
     var boundLensId by remember { mutableStateOf<String?>(null) }
+    /**
+     * ★当前是否通过 CaptureRequest.PHYSICAL_CAMERA_ID 切到物理头★
+     * true 时相机会话仍然是逻辑摄像头，只是每帧指定出图的物理头 ——
+     * 不 unbind/rebind，预览不闪、比例不跳。
+     */
+    var boundViaRequest by remember { mutableStateOf(false) }
+    /** 上一次是不是通过 request 切的（退回逻辑头时也避免无谓重绑） */
+    var lastBoundWasViaRequest by remember { mutableStateOf(false) }
+    /** PHYSICAL_CAMERA_ID 这条路是否可用（出过异常就关掉，退回重新绑定） */
+    var physicalRequestWorks by remember { mutableStateOf(true) }
+    /** 正在切换物理镜头（重绑）中。用来遮住重绑瞬间预览比例的跳变 */
+    var lensSwitching by remember { mutableStateOf(false) }
+    /**
+     * ★超广角专用：物理直连是否真的能出画面★
+     * 跟 [physicalSwitchWorks]（整条物理直连链路）分开记 ——
+     * 广角头出不了画面不代表长焦头也不行，不该一刀切把两条路都封死。
+     */
+    var physicalWideWorks by remember { mutableStateOf(true) }
     // 真实可绑定的物理头列表（由 probePhysicalCameras 独立扫描，保证是真 id）
     var physicalLensOptions by remember {
         mutableStateOf<List<DeviceCompatibility.LensProfile>>(emptyList())
@@ -2028,9 +3014,23 @@ fun CameraApp() {
     var physicalSwitchWorks by remember { mutableStateOf(true) }
     // 物理头绑定完成后要落到哪个"全局倍率"
     var pendingZoomTarget by remember { mutableFloatStateOf(0f) }
+    /** 用户请求的、超过 HAL 上限的目标倍率（0 = 当前没有扩展数码变焦） */
+    var boostTarget by remember { mutableFloatStateOf(0f) }
     // ★逻辑摄像头到不了广角★ HAL 把 minZoomRatio 报成 1.0，但本机确实有 0.6x 光学档。
     // 置 true 后，所有 <1.0 的目标一律走物理直连，不再浪费一次无效下发。
     var logicWideBlocked by remember { mutableStateOf(false) }
+    // ★逻辑摄像头到不了长焦★ 真我 GT5 Pro / iQOO 10 Pro 等机型：
+    // setZoomRatio(3x) 不报错、回读倍率也到位，但画面一直是主摄裁切。
+    // 置 true 后，>=1.8x 的目标会去直连真实的长焦物理头。
+    var telePreferPhysical by remember { mutableStateOf(DeviceCompatibility.isKnownTeleStubborn) }
+    /** 长焦头绑定失败计数：达到 [TELE_BIND_FAIL_LIMIT] 才真正禁用，避免一次偶发失败就永久封死 */
+    var teleBindFailCount by remember { mutableIntStateOf(0) }
+    /**
+     * ★长焦专用：物理直连长焦是否可用★
+     * 与 [physicalWideWorks]（广角）、[physicalSwitchWorks]（整条链路）分开记 ——
+     * 长焦头绑不上不代表广角头也不行，不该一刀切把两条路都封死。
+     */
+    var physicalTeleWorks by remember { mutableStateOf(true) }
 
     var hasPermissions by remember {
         mutableStateOf(
@@ -2074,8 +3074,20 @@ fun CameraApp() {
         }
         val current = AppUpdate.currentVersionCode(context)
         val skipped = AppUpdate.skippedCode(context)
-        Log.d("Update", "当前=$current, 服务器=${info.versionCode}, 已跳过=$skipped")
+        Log.d(
+            "Update",
+            "本地=$APP_VERSION_NAME(code=$current) | " +
+                    "服务器=${info.versionName}(code=${info.versionCode}) | 已跳过=$skipped"
+        )
         when {
+            // ★版本号字符串相同 = 已经是最新版★
+            // 发版时只改了 APP_VERSION_NAME、忘了同步 build.gradle 的 versionCode，
+            // 判断又只比 versionCode，结果就是"装的明明是最新版，却一直弹更新"。
+            // 这里用名字兜底：名字对得上就认定是最新版，直接不弹。
+            info.versionName.isNotBlank() &&
+                    info.versionName.trim().equals(APP_VERSION_NAME.trim(), ignoreCase = true) -> {
+                Log.d("Update", "不弹窗：版本号与服务器一致（$APP_VERSION_NAME），已是最新版")
+            }
             info.versionCode <= current ->
                 Log.d("Update", "不弹窗：服务器版本号不大于本地，请把 JSON 的 versionCode 调大")
             info.versionCode == skipped ->
@@ -2129,6 +3141,19 @@ fun CameraApp() {
     var videoFrameRate by remember { mutableStateOf(VideoFrameRate.FPS_30) }
     // 录像防抖开关。★默认关闭★（进视频模式时不自动开启，由用户手动打开）
     var videoStabilization by remember { mutableStateOf(false) }
+    // ── 苹果风格调色盘 ──
+    var toneWarmth by remember { mutableFloatStateOf(0f) }
+    var toneTint by remember { mutableFloatStateOf(0f) }
+    var toneIntensity by remember { mutableFloatStateOf(100f) }
+    var showColorPalette by remember { mutableStateOf(false) }
+    /** 多级菜单：null=关闭，否则是"一级/二级"路径 */
+    var menuPath by remember { mutableStateOf<String?>(null) }
+    /**
+     * ★装不下的状态栏按键★
+     * 由 SettingsChipsRow / SettingsChipsColumn 量完可用空间后回填，
+     * 这些按键不再画成 chip，改到菜单里出现（菜单键本身永不溢出）。
+     */
+    var hiddenChipIds by remember { mutableStateOf<Set<String>>(emptySet()) }
     // ★自动旋转开关★ true = 屏幕方向跟随传感器；false = 跟随系统设置
     var autoRotate by remember { mutableStateOf(true) }
     var stabilizationSupported by remember { mutableStateOf(true) }
@@ -2152,15 +3177,37 @@ fun CameraApp() {
 
     val isFront = lensFacing == CameraSelector.LENS_FACING_FRONT
 
+    /** 专业模式当前展开的参数（横屏要把模式栏换成参数面板，所以提升到这） */
+    var proActiveParam by remember { mutableStateOf<ProParam?>(null) }
+    // ★离开专业模式（切模式 / 切前后摄）时把面板收起来★
+    // 否则参数面板会一直占着模式栏的位置，模式栏再也回不来。
+    // ⚠️ 必须放在 isFront 声明【之后】：Kotlin 局部变量要先声明后使用，
+    //    放到上面会报 Unresolved reference 'isFront'。
+    LaunchedEffect(mode, isFront) {
+        if (mode != CaptureMode.PRO || isFront) proActiveParam = null
+    }
+
     val sessionMedia = remember { mutableStateListOf<CapturedMedia>() }
     var showGallery by remember { mutableStateOf(false) }
 
     // vivo 适配：变焦范围改成从 zoomState 实时读，不再写死 0.6x~10x。
     // X80 Pro 的 0.6x 超广角 / 5x 潜望能不能被 HAL 正常上报因机而异，读出来才准。
     var minZoomRatio by remember { mutableFloatStateOf(0.6f) }
+    /** HAL 原生上报的变焦上限（不含本次新增的"扩展数码变焦"部分） */
+    var halMaxZoomRatio by remember { mutableFloatStateOf(10.0f) }
     var maxZoomRatio by remember { mutableFloatStateOf(10.0f) }
     val minRatio = minZoomRatio
     val maxRatio = maxZoomRatio
+    /** ★照片最高 50x、录像最高 15x★：模式决定 UI 上限 */
+    val desiredMaxZoom: Float = if (mode == CaptureMode.VIDEO) MAX_VIDEO_ZOOM else MAX_PHOTO_ZOOM
+    /**
+     * ★扩展数码变焦★：超过 HAL 上限的那部分倍率。
+     * 预览靠缩放实现、拍照靠中心裁切实现，两者同比例，所以取景与成片一致。
+     * 物理头直连时不做（那颗头的本地域另有换算），避免叠加出错误倍率。
+     */
+    val digitalBoost: Float =
+        if (boundLensId != null) 1f
+        else (displayedRatio / halMaxZoomRatio.coerceAtLeast(0.001f)).coerceAtLeast(1f)
 
     // 原厂镜头参数：每次绑定相机时读取，变焦档位/标定/吸附都以它为准
     var lensProfiles by remember { mutableStateOf<List<DeviceCompatibility.LensProfile>>(emptyList()) }
@@ -2225,26 +3272,24 @@ fun CameraApp() {
      * 松手/点档位时如果离某颗物理头很近(±10%)，直接吸到那颗头上，走原生光学输出。
      */
     fun snapToOptical(ratio: Float): Float {
-        if (lensProfiles.isEmpty()) return ratio
-        val best = lensProfiles.minByOrNull { abs(it.zoomFactor - ratio) } ?: return ratio
+        // 物理头的 id 在 physicalLensOptions 里，只查 lensProfiles 会漏掉长焦头，
+        // 导致松手时永远吸不到 3x 光学档。
+        val pool = (lensProfiles + physicalLensOptions)
+            .filter { DeviceCompatibility.isRealCameraId(it.id) }
+            .distinctBy { it.id }
+        if (pool.isEmpty()) return ratio
+        val best = pool.minByOrNull { abs(it.zoomFactor - ratio) } ?: return ratio
         return if (onThisLens(ratio, best.zoomFactor)) best.zoomFactor else ratio
     }
 
     val isUltraWide = currentRatio < 0.95f && minZoomRatio < 0.95f && !isFront
-    val ultraWidePaint = remember {
-        Paint().apply {
-            colorFilter = ColorFilter.colorMatrix(
-                ColorMatrix(
-                    floatArrayOf(
-                        1.25f, 0f, 0f, 0f, -18f,
-                        0f, 1.25f, 0f, 0f, -18f,
-                        0f, 0f, 1.25f, 0f, -18f,
-                        0f, 0f, 0f, 1f, 0f
-                    )
-                )
-            )
-        }
-    }
+    // ★超广角滤镜已删除★
+    // 原来这里有一个 ultraWidePaint（对比度 1.25 + 偏移 -18），只在 <0.95x 时通过
+    // saveLayer 套到整个预览上。两个问题：
+    //   ① 1.25*x - 18 会把所有低于 14/255 的像素直接压成纯黑，
+    //      暗光环境下整幅画面几乎全黑 —— 表现就是"切到超广角后不显示画面"；
+    //   ② saveLayer + ColorFilter 每帧开一层离屏缓冲，部分 GPU 上直接渲染成空层。
+    // 现在预览只走 drawContent()，不再套任何滤镜。
 
     /**
      * 倍率 → linearZoom。
@@ -2277,7 +3322,9 @@ fun CameraApp() {
 
     /** 当前绑定物理头的光学倍率；未直连（用逻辑摄像头）时为 1.0 */
     fun boundLensFactor(): Float =
-        boundLensId?.let { id -> lensProfiles.firstOrNull { it.id == id }?.zoomFactor } ?: 1f
+        (lensProfiles + physicalLensOptions)
+            .filter { DeviceCompatibility.isRealCameraId(it.id) }
+            .firstOrNull { it.id == boundLensId }?.zoomFactor ?: 1f
 
     /** 全局倍率 → 真正下发给相机的本地倍率（物理头自己就是 1.0x，要除掉它的光学倍率） */
     /**
@@ -2309,12 +3356,50 @@ fun CameraApp() {
         if (boundLensId != null) (boundLensFactor() * 4f).coerceAtMost(maxRatio) else maxRatio
 
     /**
+     * 真正下发给相机的倍率。
+     *
+     * ★为什么要单独截一次★：UI 上最高能点到 50x，但 CameraX 的 setZoomRatio 超过
+     * HAL 上限会被静默 clamp 回来。所以：
+     *   · HAL 上限以内 → 正常下发（画质最好）
+     *   · HAL 上限以外 → 下发 HAL 上限，多出来的倍数走[扩展数码变焦]
+     *     （预览缩放 + 拍照中心裁切）
+     */
+    fun clampForHal(global: Float): Float {
+        val halCap = halMaxZoomRatio * (if (boundLensId != null) boundLensFactor() else 1f)
+        val cap = halCap.coerceAtLeast(minRatio)
+        return localZoomOf(global).coerceAtMost(cap)
+    }
+
+    /** 照片 50x / 录像 15x：把 HAL 上限截到本模式允许的最大值 */
+    /**
+     * ★UI 倍率上限★
+     *
+     * ⚠️ 这里曾经写成 `halMax.coerceAtMost(desiredMaxZoom)` —— 于是 HAL 只报 2.5x 的机器
+     *    （ColorOS 对第三方 App 限制变焦范围，OPPO Find X7 就报 0.7~2.5），
+     *    UI 上限直接变成 2.5x，50x 的扩展数码变焦**完全用不上**，
+     *    表现就是"轮盘只有 0.7x 到 2.5x"。
+     *
+     * 现在固定取模式上限（照片 50x / 录像 15x）：
+     *   · HAL 上限以内 → 原生变焦（画质最好）
+     *   · 超出 HAL 上限 → 走[扩展数码变焦]（预览缩放 + 拍照同比例中心裁切）
+     * HAL 原生上限单独记在 [halMaxZoomRatio]，供 [clampForHal] 判断用哪条路。
+     */
+    fun zoomCapFor(halMax: Float): Float = desiredMaxZoom
+
+    /**
      * 承载某个全局倍率的物理头：不超过它、且最接近的那颗。
      * ★优先用 probePhysicalCameras 扫出来的真实 id 池★
      * lensProfiles 探测失败时装的是画像虚拟 id，拿去 bind 会失败。
      */
     fun lensForTarget(global: Float): DeviceCompatibility.LensProfile? {
-        val real = physicalLensOptions.filter { DeviceCompatibility.isRealCameraId(it.id) }
+        // ★只挑"能独立打开"的头★
+        // ⚠️ 这是 Find X7 上 0.6x 失效的根因：现在池里会包含只挂在 physicalCameraIds 下、
+        //    不在 cameraIdList 里的头（ColorOS 常见）。这种头 CameraX 的 CameraFilter
+        //    根本匹配不到，绑它必然失败 → 广角被判定"物理直连不可用"并永久封禁
+        //    → 0.6x 从此彻底用不了。
+        val real = physicalLensOptions.filter {
+            DeviceCompatibility.isRealCameraId(it.id) && DeviceCompatibility.canBindDirectly(it.id)
+        }
         val pool: List<DeviceCompatibility.LensProfile> =
             if (real.isNotEmpty()) real
             else lensProfiles.filter { DeviceCompatibility.isRealCameraId(it.id) }
@@ -2325,63 +3410,309 @@ fun CameraApp() {
     }
 
     /**
+     * ★挑一颗能到达 [target] 的长焦物理头★
+     *
+     * 三个调用点（smoothZoomTo / commitZoom / requestLensSwitchIfNeeded）以前各写一份
+     * 15% 容差的挑选，导致判定不一致：同一个 3x 在某些路径挑得中、某些挑不中。
+     *
+     * 这里统一成两步，这是"OPPO Find 调不出长焦"的成因②：
+     *   ① 先在 ±20% 内挑【最接近】的（比原来 15% 宽，覆盖 2.8x 潜望对 3x 档的情况）
+     *   ② 挑不中再退一步：只要这颗头是长焦头(>= TELE_ENTER_RATIO)，取最接近的那颗。
+     *      宁可让 3x 落在 2.8x 头上做一点点数码裁切，也别退回主摄裁切 ——
+     *      后者才是"长焦调不出来"的表现。
+     */
+    fun pickTeleFor(target: Float): DeviceCompatibility.LensProfile? {
+        if (!telePreferPhysical) return null
+        if (!physicalTeleWorks) return null
+        if (target < DeviceCompatibility.TELE_ENTER_RATIO) return null
+        // ★只挑"能独立打开"的头★
+        // 不在 cameraIdList 里的（ColorOS 挂在 physicalCameraIds 下的那些），
+        // CameraX 的 CameraFilter 匹配不到，绑了必然失败 ——
+        // 以前不区分，挑中一颗绑不上的头 → 失败 → 累计封禁 → 长焦彻底没戏。
+        val pool = physicalLensOptions.filter { DeviceCompatibility.isRealCameraId(it.id) }
+        val bindable = pool.filter { DeviceCompatibility.canBindDirectly(it.id) }
+        // ★退一步★：能重新绑定的头优先（老路，已适配机型行为不变）；
+        // 一台都没有时才考虑"只能靠 PHYSICAL_CAMERA_ID 切"的头（OPPO Find X7 的副摄）
+        val usable = if (bindable.isNotEmpty()) bindable
+        else pool.filter { DeviceCompatibility.isSwitchableViaRequest(it.id) }
+        val tele = usable.filter { it.zoomFactor >= DeviceCompatibility.TELE_ENTER_RATIO - 0.01f }
+        if (tele.isEmpty()) {
+            val known = pool.filter { it.zoomFactor >= DeviceCompatibility.TELE_ENTER_RATIO - 0.01f }
+            if (known.isNotEmpty()) {
+                Log.w(
+                    "Camera",
+                    "本机有长焦头但都不可独立打开（不在 cameraIdList），" +
+                            "物理直连不可用，长焦交给逻辑摄像头 setZoomRatio"
+                )
+                // 关掉物理直连，让逻辑头接手 —— 至少倍率能到，不会卡住
+                telePreferPhysical = false
+            }
+            return null
+        }
+
+        // ★★只挑"扛得住目标倍率"的那颗★★
+        // ⚠️ 这是"10x 切不了"的根因：原来没有这个约束，
+        //    点 10x 时会挑中池里唯一那颗 3x 长焦头 → 直连过去 →
+        //    本地要下发 10/3 = 3.33x，而单颗物理头本地往往只有 1.0~2.0x，
+        //    于是倍率被 clamp 住、切不过去，还把"回逻辑头"这条路也堵死了。
+        // 现在：目标必须 ≤ 该头倍率 × TELE_HEAD_ROOM，否则认为这颗头扛不住。
+        val capable = tele.filter { target <= it.zoomFactor * DeviceCompatibility.TELE_HEAD_ROOM }
+        if (capable.isEmpty()) {
+            Log.d(
+                "Camera",
+                "目标 ${"%.2f".format(target)}x 超出所有长焦头的承载范围" +
+                        "（最大 ${tele.maxOf { it.zoomFactor }}x × ${DeviceCompatibility.TELE_HEAD_ROOM}），" +
+                        "改由逻辑摄像头 setZoomRatio 承担"
+            )
+            return null
+        }
+
+        // ① ±20% 内最接近的
+        val near = capable.filter { abs(it.zoomFactor - target) <= target * 0.20f }
+            .minByOrNull { abs(it.zoomFactor - target) }
+        if (near != null) return near
+        // ② 兜底：取【倍率最大的那颗】—— 优先让视野更近的那颗去承担，数码裁切更少。
+        //    （在 capable 里挑，已保证扛得住）
+        return capable.maxByOrNull { it.zoomFactor }
+    }
+
+    /**
      * 目标倍率如果"当前这颗头到不了"，就切到能到位那颗物理头。
      *
      * @return true 表示已发起切换（会重新绑定相机），调用方应直接 return，
      *         倍率会在绑定完成后按 pendingZoomTarget 落位。
      */
+    /**
+     * ★物理直连这条路径现在还能不能用★（按目标类型分开判定）
+     *
+     * ⚠️ 这里原来是 `if (!physicalSwitchWorks) return false` —— 一个全局总闸。
+     *    只要【任何一次】物理头绑定失败（哪怕是广角头失败一次），它就永久 false，
+     *    于是后面所有直连（包括长焦）全部被这道门禁挡掉 ——
+     *    这才是"OPPO Find 怎么都调不出长焦"的真正最后一环：
+     *    Find 有 preferPhysicalWide，一点 0.6x 就走广角直连，
+     *    广角失败一次 → 总闸关闭 → 长焦这辈子都调不出来。
+     *
+     * 现在按"要去的那颗头是哪种"分开判定，广角失败不影响长焦，反之亦然。
+     */
+    fun physicalPathOpen(target: Float): Boolean = when {
+        target < 0.95f -> physicalWideWorks
+        target >= DeviceCompatibility.TELE_ENTER_RATIO -> physicalTeleWorks
+        else -> physicalSwitchWorks
+    }
+
+    /**
+     * ★★变焦/换头诊断 dump★★
+     *
+     * 调不出长焦时先看这个：它会把"池里到底有几颗头、各自倍率多少、哪个开关关着"
+     * 一次性打出来，一眼就能定位卡在哪一环，不用再靠猜。
+     */
+    fun dumpLensSwitchState(tag: String, target: Float) {
+        val pool = physicalLensOptions.filter { DeviceCompatibility.isRealCameraId(it.id) }
+        val sb = StringBuilder()
+        sb.append("===== 镜头切换诊断 [$tag] 目标=${"%.2f".format(target)}x =====\n")
+        sb.append("机型: MODEL=${Build.MODEL} DEVICE=${Build.DEVICE} BRAND=${Build.BRAND}\n")
+        sb.append("识别: Find系列=${DeviceCompatibility.isOppoFindSeries} " +
+                "一加顽固=${DeviceCompatibility.isOnePlusTeleStubborn} " +
+                "已知顽固=${DeviceCompatibility.isKnownTeleStubborn}\n")
+        sb.append("开关: telePreferPhysical=$telePreferPhysical " +
+                "physicalTeleWorks=$physicalTeleWorks " +
+                "physicalWideWorks=$physicalWideWorks " +
+                "physicalSwitchWorks=$physicalSwitchWorks\n")
+        sb.append("路径对本目标开放=${physicalPathOpen(target)}  " +
+                "当前直连=${boundLensId ?: "逻辑摄像头"}  " +
+                "逻辑头范围=${"%.2f".format(minRatio)}~${"%.2f".format(maxRatio)}x\n")
+        sb.append("物理头池(${pool.size} 颗):\n")
+        for (p in pool) {
+            sb.append(
+                "    id=${p.id} 倍率=${p.zoomFactor}x " +
+                        "焦距=${"%.2f".format(p.focalLengthMm)}mm " +
+                        "等效=${"%.1f".format(p.equiv35mm)}mm " +
+                        "maxJpeg=${p.maxJpegW}x${p.maxJpegH}\n"
+            )
+        }
+        if (pool.isEmpty()) sb.append("    （池是空的！probePhysicalCameras 没扫到任何可绑定头）\n")
+        val picked = pickTeleFor(target)
+        sb.append("pickTeleFor 结果=${if (picked != null) "${picked.id}(${picked.zoomFactor}x)" else "null"}\n")
+        if (picked == null) {
+            sb.append("  → 为空的原因可能是：\n")
+            sb.append("    ① telePreferPhysical=false（机型没识别 且 硬件兜底没触发）\n")
+            sb.append("    ② physicalTeleWorks=false（长焦被封过）\n")
+            sb.append("    ③ 池里没有 >=${DeviceCompatibility.TELE_ENTER_RATIO}x 的头" +
+                    "（长焦头没上报焦距且 reconcileStops 没指派成功时会出现）\n")
+        }
+        sb.append("=========================================")
+        Log.d("Camera", sb.toString())
+    }
+
     fun requestLensSwitchIfNeeded(target: Float): Boolean {
-        if (!physicalSwitchWorks) return false
+        // ★每次尝试换头都打一份诊断★：调不出长焦时直接看 Logcat，不用猜
+        dumpLensSwitchState("requestLensSwitch", target)
+        if (!physicalPathOpen(target)) {
+            Log.d(
+                "Camera",
+                "物理直连路径对 ${"%.2f".format(target)}x 已关闭 " +
+                        "(wide=$physicalWideWorks, tele=$physicalTeleWorks, other=$physicalSwitchWorks)"
+            )
+            return false
+        }
         if (isFront) return false
+        // ★录像中绝不换头★ 换头要 unbindAll 重绑，会直接把正在录的视频打断
+        if (isRecording) return false
         // 用真实可绑定物理头的数量判断，而不是 lensProfiles
         // （后者可能全是画像虚拟 id，size 看着够其实一颗都 bind 不了）
-        val pool = physicalLensOptions.filter { DeviceCompatibility.isRealCameraId(it.id) }
-        if (pool.size < 2) return false
+        // ★只算"能独立打开"的头★：不可直连的头凑数会让 pool.size >= 2 成立，
+        //    但真去绑时一个都绑不上
+        // 能重新绑定 或 能用 PHYSICAL_CAMERA_ID 切，都算"可用"
+        val pool = physicalLensOptions.filter {
+            DeviceCompatibility.isRealCameraId(it.id) &&
+                    (DeviceCompatibility.canBindDirectly(it.id) ||
+                            DeviceCompatibility.isSwitchableViaRequest(it.id))
+        }
+        if (pool.size < 2) {
+            Log.d("Camera", "可独立绑定的物理头不足 2 颗（${pool.size}），跳过换头")
+            return false
+        }
         val lens = lensForTarget(target) ?: return false
 
+        // ★长焦优先用真实长焦头★（统一走 pickTeleFor，见那里的说明）
+        val tele: DeviceCompatibility.LensProfile? = pickTeleFor(target)
+        val wanted = if (tele != null && tele.id != boundLensId) tele else lens
+
         val inRange = target >= minRatio - 0.01f && target <= maxRatio + 0.01f
-        val sameLens = lens.id == boundLensId
+        val sameLens = wanted.id == boundLensId
+        // ★修复"切到广角之后只能调用广角"★（华为 P 系列 / OPPO Find 都中招）
+        // 老逻辑里"已直连某颗头"只在目标跑出这颗头可用区间时才换头，
+        // 而广角头(0.6x)的可用区间是 0.6~2.4x，1x / 2x 全落在区间内 → need=false，
+        // 于是永远待在广角头上做数码裁切，别的镜头一颗都调不出来。
+        // 现在补一条：目标明显偏离当前这颗头的原生倍率，就退回逻辑摄像头，
+        // 让逻辑头（必要时再直连长焦）去接手。
+        val curFactor: Float = boundLensFactor()
+        val needBackToLogic: Boolean = boundLensId != null && inRange &&
+                (target > curFactor * 1.15f + 0.01f || target < curFactor * 0.85f - 0.01f)
+
         val need: Boolean = when {
             // ★唯一允许"抢占"的情形：实测确认逻辑头到不了广角★
             // logicWideBlocked 只在下面两种情况被置 true：
             //   ① 绑定时读到 HAL 原生下限 >= 1.0，但本机确实有 <1.0 的光学档
             //   ② 变焦校验发现目标 0.6x 实际回读是 1.0x
             // 没坐实之前一律不直连 —— 否则会抢掉本来能正常工作的 setZoomRatio。
-            boundLensId == null && logicWideBlocked && target < 0.99f -> !sameLens
+            boundLensId == null && logicWideBlocked && physicalWideWorks && target < 0.99f -> !sameLens
+
+            // ★长焦走物理直连★：不管当前在哪颗头上（逻辑头 / 广角头 / 另一颗长焦头）
+            // ⚠️ 这里原来写的是 `boundLensId == null && tele != null`，只在【逻辑头】上才生效。
+            //    于是"广角头 → 3x"走不进来，被下面的退回逻辑头分支抢先处理 ——
+            //    这就是 OPPO Find 调不出长焦的成因①（见下方"长焦优先"分支的说明）。
+            tele != null -> !sameLens
 
             // 当前用逻辑摄像头：只在"逻辑头范围根本够不到"时才走直连。
             // ⚠️ 这里曾经按机型预判优先直连，结果把本来能正常变焦的小米机型搞坏了，
             //    所以现在不看机型，只看范围。
             boundLensId == null ->
-                !inRange && abs(lens.zoomFactor - target) < 0.01f
+                !inRange && abs(wanted.zoomFactor - target) < 0.01f
 
             // 已直连某颗头：目标跑出这颗头的可用区间了才换头
             else -> !sameLens && (target < effMinZoom() - 0.01f || target > effMaxZoom() + 0.01f)
         }
 
-        if (!need) return false
+        if (!need && !needBackToLogic) return false
 
-        // ★离开当前物理头时，优先"退回逻辑摄像头"而不是直连另一颗物理头★
-        // 例：广角头(0.6x)上想切到 3x。3x 逻辑摄像头用 setZoomRatio 就能到，
-        // 没必要再去绑一颗物理主摄 —— 每次绑物理头都要 unbindAll 重来，
-        // 预览会先闪一下、画面比例也跟着变一下（就是反馈里"突然更改一下比例"的现象）。
-        // 回到逻辑头之后，后续变焦都是纯 setZoomRatio，不再反复重绑。
-        if (boundLensId != null && target >= minRatio - 0.01f && target <= maxRatio + 0.01f) {
+        // ★★已在长焦头上、但目标超出这颗头的承载范围 → 必须先退回逻辑头★★
+        // 例：3x 头上点 10x。此时 pickTeleFor(10) 返回 null（扛不住），
+        //     但下面的 needBackToLogic 用的阈值是 1.15 倍而 effMaxZoom 给的是 4 倍余量，
+        //     两者不一致会出现"既不该直连、又判定不用退回"的死角。
+        //     这里显式补上：只要当前在长焦头且目标超出承载，就退回逻辑头走 setZoomRatio。
+        val curF: Float = boundLensFactor()
+        if (boundLensId != null && curF >= DeviceCompatibility.TELE_ENTER_RATIO &&
+            target > curF * DeviceCompatibility.TELE_HEAD_ROOM &&
+            target >= minRatio - 0.01f && target <= maxRatio + 0.01f
+        ) {
+            Log.d(
+                "Camera",
+                "目标 ${"%.2f".format(target)}x 超出当前长焦头 ${boundLensId}(${curF}x) 的承载，" +
+                        "退回逻辑摄像头"
+            )
+            pendingZoomTarget = target
+            boundLensId = null
+            boundViaRequest = false
+            lensSwitching = true
+            return true
+        }
+
+        // ★★长焦优先：目标在长焦档且有长焦头能到位 → 直接换过去，绝不退回逻辑头★★
+        //
+        // 这是"OPPO Find 调不出长焦"的主因。原来的流程是：
+        //   广角头(0.6x) 上点 3x → needBackToLogic = true（3.0 远超 0.6×1.15）
+        //   → 落到下面的"退回逻辑摄像头"分支 → 重绑逻辑头 → setZoomRatio(3.0)
+        //   → 主摄数码裁切，长焦头永远没被绑过。
+        // OPPO Find 有 preferPhysicalWide，ColorOS 上 logicWideBlocked 基本为 true，
+        // 所以点过一次 0.6x 之后，长焦就再也调不出来了。
+        //
+        // 现在：只要目标是长焦档且选中了长焦头，就从当前这颗头【直接换】到那颗长焦头。
+        if (tele != null && tele.id != boundLensId &&
+            target >= DeviceCompatibility.TELE_ENTER_RATIO
+        ) {
+            Log.d(
+                "Camera",
+                "直连长焦头 ${tele.id}（${tele.zoomFactor}x）以到达 ${"%.2f".format(target)}x" +
+                        "（从 ${boundLensId ?: "逻辑摄像头"} 直接切换）"
+            )
+            pendingZoomTarget = target
+            lensSwitching = true
+            boundLensId = tele.id      // 改它就会触发绑定流程重跑
+            return true
+        }
+
+        // ★离开当前物理头：只有退到主摄区间（<1.55x）才回逻辑头★
+        // 老代码是"目标落在逻辑头范围内就回逻辑头"，结果在长焦头上从 3x 拖到 2.8x
+        // 也会解绑回逻辑头 —— 画面先闪一下又变回主摄裁切，这正是"长焦站不住"的元凶。
+        if (boundLensId != null && (needBackToLogic || target < DeviceCompatibility.TELE_EXIT_RATIO) &&
+            target >= minRatio - 0.01f && target <= maxRatio + 0.01f
+        ) {
             Log.d(
                 "Camera",
                 "离开物理头 ${boundLensId}，退回逻辑摄像头并落到 ${"%.2f".format(target)}x"
             )
             pendingZoomTarget = target
             boundLensId = null
+            boundViaRequest = false
+            lensSwitching = true
+            return true
+        }
+
+        // ★★优先用 CaptureRequest.PHYSICAL_CAMERA_ID 切（不重新绑定）★★
+        //
+        // 只有在这颗头【不能独立打开】、但【挂在某个逻辑头下】时才走这条路：
+        //   · 能独立打开的头 → 继续走下面的重新绑定（老路）
+        //   · 已经适配好的机型（小米 / vivo iQOO / 真我 / 华为 P / 红米 Note）
+        //     它们的副摄都在 cameraIdList 里，永远走老路，行为完全不变
+        //   · OPPO Find X7 这类副摄只挂在 physicalCameraIds 下的 → 走这条路
+        //
+        // 好处：不 unbind/rebind → 预览不闪、画面比例不跳、录像不会被打断。
+        if (DeviceCompatibility.USE_PHYSICAL_REQUEST_SWITCH &&
+            physicalRequestWorks &&
+            !isRecording &&
+            DeviceCompatibility.isSwitchableViaRequest(wanted.id)
+        ) {
+            Log.d(
+                "Camera",
+                "★用 PHYSICAL_CAMERA_ID 切到 ${wanted.id}（${wanted.zoomFactor}x）★ " +
+                        "不重新绑定，会话仍是逻辑摄像头"
+            )
+            pendingZoomTarget = target
+            lensSwitching = true
+            boundViaRequest = true
+            boundLensId = wanted.id     // 触发绑定流程；那里识别 boundViaRequest 后会跳过重绑
             return true
         }
 
         Log.d(
             "Camera",
-            "切换物理头 ${lens.id}（${lens.zoomFactor}x）以到达 ${"%.2f".format(target)}x"
+            "切换物理头 ${wanted.id}（${wanted.zoomFactor}x）以到达 ${"%.2f".format(target)}x"
         )
         pendingZoomTarget = target
-        boundLensId = lens.id      // 改它就会触发绑定流程重跑
+        lensSwitching = true
+        boundViaRequest = false
+        boundLensId = wanted.id      // 改它就会触发绑定流程重跑
         return true
     }
 
@@ -2421,27 +3752,27 @@ fun CameraApp() {
         videoStabilization && stabilizationSupported && mode == CaptureMode.VIDEO
 
     /**
-     * 直接下发防抖开关（EIS + OIS），不做任何模式判断。
-     * 给变焦期间"临时挂起 / 恢复"用——那时需要绕过 mode 检查强行关掉。
+     * 把"用哪颗物理头出图"写进 CaptureRequest 包（只追加，不清空）。
      */
     @OptIn(ExperimentalCamera2Interop::class)
-    fun setStabilizationRaw(enabled: Boolean) {
-        val cam = camera ?: return
+    fun appendPhysicalCameraId(b: CaptureRequestOptions.Builder) {
+        if (!DeviceCompatibility.USE_PHYSICAL_REQUEST_SWITCH) return
+        if (!physicalRequestWorks) return
+        val pid = if (boundViaRequest) boundLensId else null
+        if (pid == null) return
+        if (!DeviceCompatibility.isSwitchableViaRequest(pid)) return
+        // PHYSICAL_CAMERA_ID 是 API 29 才有的 key；反射拿不到就退回老路
+        val key = DeviceCompatibility.physicalCameraIdKey()
+        if (key == null) {
+            physicalRequestWorks = false
+            Log.w("Camera", "本系统无 PHYSICAL_CAMERA_ID，退回重新绑定物理头的老路")
+            return
+        }
         try {
-            val b = CaptureRequestOptions.Builder()
-            b.setCaptureRequestOption(
-                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                if (enabled) CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
-                else CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
-            )
-            b.setCaptureRequestOption(
-                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-                if (enabled) CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
-                else CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
-            )
-            Camera2CameraControl.from(cam.cameraControl).setCaptureRequestOptions(b.build())
+            b.setCaptureRequestOption(key, pid)
         } catch (e: Exception) {
-            Log.w("Camera", "设置防抖失败", e)
+            physicalRequestWorks = false
+            Log.w("Camera", "PHYSICAL_CAMERA_ID 下发失败，退回重新绑定物理头的老路", e)
         }
     }
 
@@ -2528,8 +3859,30 @@ fun CameraApp() {
             }
             b.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, wbMode)
 
+            // ★物理镜头切换★：专业模式同样要带，否则下发参数包会把 PHYSICAL_CAMERA_ID 清掉
+            appendPhysicalCameraId(b)
+
             // 防抖要跟手动参数一起下发：setCaptureRequestOptions 是全量替换，
             // 分开调会把对方清掉。录像模式下才开，拍照时开了会压低分辨率。
+            // ★降噪 / 边缘★：专业模式同样以减噪点为主
+            b.setCaptureRequestOption(
+                CaptureRequest.NOISE_REDUCTION_MODE,
+                CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY
+            )
+            b.setCaptureRequestOption(
+                CaptureRequest.EDGE_MODE,
+                if (mode == CaptureMode.VIDEO) CameraMetadata.EDGE_MODE_OFF
+                else CameraMetadata.EDGE_MODE_HIGH_QUALITY
+            )
+            // 帧率：专业模式也锁住，避免自动曝光把帧率拉下来拖慢取景
+            b.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                Range(
+                    if (mode == CaptureMode.VIDEO) videoFrameRate.fps else DEFAULT_PREVIEW_FPS,
+                    if (mode == CaptureMode.VIDEO) videoFrameRate.fps else DEFAULT_PREVIEW_FPS
+                )
+            )
+
             val stabOn = wantStabilization()
             b.setCaptureRequestOption(
                 CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
@@ -2542,6 +3895,8 @@ fun CameraApp() {
                 else CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
             )
 
+            // 同上：先清空，保证切回逻辑头时 PHYSICAL_CAMERA_ID 真的消失
+            c2.clearCaptureRequestOptions()
             c2.setCaptureRequestOptions(b.build())
             Log.d(
                 "Camera",
@@ -2550,6 +3905,91 @@ fun CameraApp() {
         } catch (e: Exception) {
             Log.e("Camera", "应用专业参数失败", e)
         }
+    }
+
+    /**
+     * ★统一 Camera2 参数包★：帧率 + 降噪 + 边缘 + 防抖 + 对焦模式，一次下发。
+     *
+     * 为什么必须合并到一个包里：Camera2CameraControl.setCaptureRequestOptions 是
+     * 【全量替换】，以前"防抖""帧率""降噪"各下发一次，后一次会把前一次清掉，
+     * 于是帧率永远落不下去 —— 这就是"选了 60 帧、实际还是 30 帧"的根因。
+     *
+     * @param stabOverride 临时覆盖防抖开关（变焦期间要挂起防抖）
+     * @param afSmooth     变焦期间切 CONTINUOUS_VIDEO，避免每一步都重新寻焦造成卡顿
+     */
+    @OptIn(ExperimentalCamera2Interop::class)
+    fun applySceneParams(stabOverride: Boolean? = null, afSmooth: Boolean = false) {
+        val cam = camera ?: return
+        if (mode == CaptureMode.PRO && manualControlSupported) {
+            applyProParams(proIso, proShutterNs, proEv, proFocus, proWb)
+            return
+        }
+        try {
+            val b = CaptureRequestOptions.Builder()
+
+            // ① 帧率：预览锁 30，录像按所选档位锁死 → 实际帧率与设置一致
+            val fps = if (mode == CaptureMode.VIDEO) videoFrameRate.fps else DEFAULT_PREVIEW_FPS
+            b.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps)
+            )
+
+            // ② 降噪（本次重点：以减少噪点为主）
+            //    照片 / 30 帧录像用 HIGH_QUALITY；60 帧录像降一档 FAST 保帧率
+            val nrMode = if (mode == CaptureMode.VIDEO && fps >= 60)
+                CameraMetadata.NOISE_REDUCTION_MODE_FAST
+            else CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY
+            b.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, nrMode)
+
+            // ③ 边缘增强：录像时关掉，锐化会把噪点一起放大
+            b.setCaptureRequestOption(
+                CaptureRequest.EDGE_MODE,
+                if (mode == CaptureMode.VIDEO) CameraMetadata.EDGE_MODE_OFF
+                else CameraMetadata.EDGE_MODE_HIGH_QUALITY
+            )
+
+            // ④ 防抖
+            val on = stabOverride ?: (videoStabilization && wantStabilization())
+            b.setCaptureRequestOption(
+                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                if (on) CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                else CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+            )
+            b.setCaptureRequestOption(
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                if (on) CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON
+                else CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF
+            )
+
+            // ⑤ 对焦模式：变焦期间用 CONTINUOUS_VIDEO，对焦不重新搜索，
+            //    从大焦段切回小焦段时不再一卡一卡
+            b.setCaptureRequestOption(
+                CaptureRequest.CONTROL_AF_MODE,
+                if (afSmooth) CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+                else CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+            )
+
+            // ⑥ ★物理镜头切换★：不重新绑定，直接指定逻辑摄像头用哪颗物理头出图。
+            //    ⚠️ 必须放在【同一个 bundle】里：setCaptureRequestOptions 是全量替换，
+            //       分开调会把前面 ①~⑤ 全部清掉（帧率/防抖/降噪互相覆盖就是这么来的）。
+            appendPhysicalCameraId(b)
+
+            val ctrl = Camera2CameraControl.from(cam.cameraControl)
+            // CaptureRequestOptions 没有"移除某一项"的 API，先清空再整体下发，
+            // 这样切回逻辑摄像头时 PHYSICAL_CAMERA_ID 才会真正消失
+            ctrl.clearCaptureRequestOptions()
+            ctrl.setCaptureRequestOptions(b.build())
+        } catch (e: Exception) {
+            Log.w("Camera", "下发场景参数失败", e)
+        }
+    }
+
+    /**
+     * 直接下发防抖开关（EIS + OIS），不做任何模式判断。
+     * 给变焦期间"临时挂起 / 恢复"用——那时需要绕过 mode 检查强行关掉。
+     */
+    @OptIn(ExperimentalCamera2Interop::class)
+    fun setStabilizationRaw(enabled: Boolean) {
+        applySceneParams(stabOverride = enabled)
     }
 
     /**
@@ -2566,7 +4006,6 @@ fun CameraApp() {
      * ⚠️ 必须定义在 applyProParams 之后：Kotlin 的局部函数只能引用【前面】已声明的，
      *    放在前面会 Unresolved reference。
      */
-    @OptIn(ExperimentalCamera2Interop::class)
     fun applyStabilization(enabled: Boolean) {
         val cam = camera ?: return
         if (mode == CaptureMode.PRO && manualControlSupported) {
@@ -2574,7 +4013,7 @@ fun CameraApp() {
             return
         }
         val on = enabled && wantStabilization()
-        setStabilizationRaw(on)
+        applySceneParams(stabOverride = on)
         Log.d(
             "Camera",
             "录像防抖: ${if (on) "开" else "关"}" +
@@ -2603,6 +4042,9 @@ fun CameraApp() {
         proEv = s.proEv
         proFocus = s.proFocus
         proWb = s.proWb
+        toneWarmth = s.toneWarmth
+        toneTint = s.toneTint
+        toneIntensity = s.toneIntensity
         restoredZoom = s.zoom
         selectedZoom = s.zoom
         displayedRatio = s.zoom
@@ -2636,7 +4078,10 @@ fun CameraApp() {
         proShutterNs = proShutterNs,
         proEv = proEv,
         proFocus = proFocus,
-        proWb = proWb
+        proWb = proWb,
+        toneWarmth = toneWarmth,
+        toneTint = toneTint,
+        toneIntensity = toneIntensity
     )
 
     // ── 设置自动保存（防抖 400ms）──
@@ -2644,7 +4089,8 @@ fun CameraApp() {
     LaunchedEffect(
         settingsLoaded, lensFacing, mode, photoRatio, highResMode, flashMode,
         videoQuality, videoFrameRate, videoStabilization, autoRotate, selectedZoom,
-        proIso, proShutterNs, proEv, proFocus, proWb
+        proIso, proShutterNs, proEv, proFocus, proWb,
+        toneWarmth, toneTint, toneIntensity
     ) {
         if (!settingsLoaded) return@LaunchedEffect
         delay(400) // 连续拖动参数时只存最后一次
@@ -2664,17 +4110,21 @@ fun CameraApp() {
         onDispose { activity?.lifecycle?.removeObserver(observer) }
     }
 
-    // ── 自动旋转 ──
-    // FULL_SENSOR：方向跟随传感器，不受系统"方向锁定"影响（相机横竖屏布局要靠它）。
-    // UNSPECIFIED：交回系统，由用户在系统里决定要不要转。
+    // ── 界面方向 ──
+    // ★UI 锁定竖屏★：LOCK_UI_PORTRAIT 打开后，Activity 恒定 PORTRAIT，
+    // 界面既不重排也不旋转；手机横过来只是整个竖屏界面侧躺，文字由 labelRotationDeg 转正。
+    // （关掉这个开关就回到原行为：跟随传感器 / 跟随系统）
     LaunchedEffect(autoRotate) {
         val activity = context as? ComponentActivity ?: return@LaunchedEffect
-        activity.requestedOrientation = if (autoRotate) {
+        activity.requestedOrientation = if (LOCK_UI_PORTRAIT) {
+            // PORTRAIT 而不是 FULL_SENSOR：前者是"锁死竖屏"，后者是"跟着转"
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        } else if (autoRotate) {
             ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
         } else {
             ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
-        Log.d("Camera", "自动旋转: $autoRotate")
+        Log.d("Camera", "界面方向: LOCK_UI_PORTRAIT=$LOCK_UI_PORTRAIT 自动旋转=$autoRotate")
     }
 
     // ── 横屏进入沉浸式全屏 ──
@@ -2731,11 +4181,64 @@ fun CameraApp() {
         // 设置还没恢复完就别绑，否则会用默认值绑一次再重绑一次
         if (!settingsLoaded) return@LaunchedEffect
 
+        // ★★通过 PHYSICAL_CAMERA_ID 切镜头时【不重新绑定】★★
+        // 会话一直是逻辑摄像头，只是每帧指定出图的物理头。
+        // 这里直接下发参数包 + 落位倍率，省掉 unbind/bind 的黑屏和比例跳动。
+        if (boundViaRequest && boundLensId != null && physicalRequestWorks) {
+            Log.d("Camera", "★下发 PHYSICAL_CAMERA_ID=${boundLensId}（不重新绑定）★")
+            applySceneParams()
+            val t0 = pendingZoomTarget
+            if (t0 > 0f) {
+                val f0 = boundLensFactor()
+                // 物理头收敛慢一点，给 HAL 一点时间（跟重新绑定那条路一致）
+                delay(DeviceCompatibility.teleSettleDelayMs)
+                val local0 = (t0 / f0.coerceAtLeast(0.01f)).coerceAtLeast(1f)
+                camera?.cameraControl?.setZoomRatio(local0)
+                displayedRatio = t0
+                currentRatio = t0
+                selectedZoom = nearestStop(t0)
+                pendingZoomTarget = 0f
+                Log.d(
+                    "Camera",
+                    "PHYSICAL_CAMERA_ID 切头就位：本地 ${"%.2f".format(local0)}x → 全局 ${t0}x"
+                )
+            }
+            lastBoundWasViaRequest = true
+            lensSwitching = false
+            scanDone = true
+            return@LaunchedEffect
+        }
+
+        // 从 request 切的物理头退回逻辑摄像头：会话没变过，也【不需要重绑】，
+        // 只要把 PHYSICAL_CAMERA_ID 从参数包里去掉即可。
+        if (boundLensId == null && lastBoundWasViaRequest) {
+            Log.d("Camera", "清除 PHYSICAL_CAMERA_ID，回到逻辑摄像头（不重新绑定）")
+            lastBoundWasViaRequest = false
+            applySceneParams()
+            val t1 = pendingZoomTarget
+            if (t1 > 0f) {
+                val c1 = t1.coerceIn(minZoomRatio, maxZoomRatio)
+                camera?.cameraControl?.setZoomRatio(c1)
+                displayedRatio = c1
+                currentRatio = c1
+                selectedZoom = nearestStop(c1)
+                pendingZoomTarget = 0f
+            }
+            lensSwitching = false
+            scanDone = true
+            return@LaunchedEffect
+        }
+
         var waited = 0
         while (previewViewRef == null && waited < 3000) {
             delay(50); waited += 50
         }
-        val pv = previewViewRef ?: return@LaunchedEffect
+        val pv = previewViewRef
+        if (pv == null) {
+            // PreviewView 还没建好就退出：把切换遮罩收掉，避免永久黑屏
+            lensSwitching = false
+            return@LaunchedEffect
+        }
 
         if (DeviceCompatibility.waitForLayoutBeforeBind) {
             var waitLayout = 0
@@ -2768,9 +4271,19 @@ fun CameraApp() {
             // 按钮档位不直接用它（见下方），因为很多机器没有 2x 物理头，会导致 2x 按钮消失。
             // ⚠️ knownOpticalStops 是 DeviceCompatibility 的成员，必须带前缀，
             //    裸写会报 Unresolved reference
-            opticalStops = if (lenses.size >= 2) {
-                lenses.map { it.zoomFactor }.distinct().sorted()
-            } else DeviceCompatibility.knownOpticalStops
+            // ★读取原相机焦段★（系统属性 + 厂商配置文件，读不到就空，不阻塞主流程）
+            val vendorStops = DeviceCompatibility.readVendorZoomStops(lensFacing)
+            if (vendorStops.isNotEmpty()) {
+                Log.d("Camera", "★原相机焦段★ ${vendorStops.joinToString("/")}")
+            }
+            opticalStops = when {
+                // ① 优先 Camera2 实测到的物理头等效焦距
+                lenses.size >= 2 -> lenses.map { it.zoomFactor }.distinct().sorted()
+                // ② 其次原厂配置文件里读出来的焦段
+                vendorStops.size >= 2 -> vendorStops
+                // ③ 都拿不到才用出厂档位兜底
+                else -> DeviceCompatibility.knownOpticalStops
+            }
             zoomStopsFromHardware = opticalStops.isNotEmpty()
             Log.d("Camera", "光学档位: ${opticalStops.joinToString("/").ifEmpty { "未探测到" }}")
 
@@ -2786,6 +4299,38 @@ fun CameraApp() {
                     opticalStops = realStops
                     zoomStopsFromHardware = true
                     Log.d("Camera", "光学档位已按真实物理头修正: ${realStops.joinToString("/")}")
+                }
+            }
+
+            // 扫描完就打一份，先看清楚这台机器到底扫到了什么
+            Log.d(
+                "Camera",
+                "★物理头池★ " + physicalLensOptions
+                    .filter { DeviceCompatibility.isRealCameraId(it.id) }
+                    .joinToString(", ") {
+                        "${it.id}=${it.zoomFactor}x(焦距${"%.2f".format(it.focalLengthMm)}mm" +
+                                "/等效${"%.1f".format(it.equiv35mm)}mm)"
+                    }
+            )
+
+            // ★长焦直连的硬件兜底★
+            // telePreferPhysical 的初值来自机型表 isKnownTeleStubborn，但型号号段太多
+            // （OPPO 的 PHK/CPH、一加的 KB、realme 的 RMX…）总有识别不到的情况，
+            // 识别不到 → 初值 false → 长焦头永远不直连 → "调不出长焦"。
+            // 这里按【硬件事实】补一刀：后置扫到 ≥1.8x 的真实物理头，就说明本机确实
+            // 有独立长焦头，开启直连。探测结果比型号表可靠。
+            // ⚠️ 只在后置方向生效，前置不做。
+            if (!isFront && !telePreferPhysical) {
+                val hasRealTele = physicalLensOptions
+                    .filter { DeviceCompatibility.isRealCameraId(it.id) }
+                    .any { it.zoomFactor >= DeviceCompatibility.TELE_ENTER_RATIO }
+                if (hasRealTele) {
+                    telePreferPhysical = true
+                    Log.d(
+                        "Camera",
+                        "★硬件兜底★ 后置检测到独立长焦头，已开启长焦物理直连" +
+                                "（机型表未命中：MODEL=${Build.MODEL} DEVICE=${Build.DEVICE}）"
+                    )
                 }
             }
 
@@ -2843,12 +4388,13 @@ fun CameraApp() {
             // ⚠️ 这里曾经改成"不设分辨率让 CameraX 自己挑"，理由是担心锁死分辨率会
             //    妨碍物理头切换。但实测原本带 ResolutionSelector 的版本是能正常调广角的，
             //    改掉反而引入了不确定性。既然原配置可用，就恢复原配置。
-            val preview = Preview.Builder()
-                .setResolutionSelector(
-                    ResolutionSelector.Builder().also { applyAspect(it) }.build()
-                )
-                .build()
-                .also { it.setSurfaceProvider(pv.surfaceProvider) }
+            // 抽成函数：下面分级降级时会重建 Preview，每次重新 setSurfaceProvider 是安全的
+            val previewSelector = ResolutionSelector.Builder().also { applyAspect(it) }.build()
+            fun newPreview(withResolution: Boolean): Preview =
+                Preview.Builder()
+                    .apply { if (withResolution) setResolutionSelector(previewSelector) }
+                    .build()
+                    .also { it.setSurfaceProvider(pv.surfaceProvider) }
 
             val resolutionSelector = if (highResMode) {
                 // ★高像素 = 本机在所选比例下能拍到的最大像素，不再写死 5000 万★
@@ -2906,29 +4452,6 @@ fun CameraApp() {
                     .build()
             }
 
-            val ic = ImageCapture.Builder()
-                .setResolutionSelector(resolutionSelector)
-                .setCaptureMode(
-                    if (highResMode) ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY
-                    else ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
-                )
-                .build()
-
-            // 录像用例。高像素模式下不创建——三流共存会拖低拍照分辨率
-            val vc = if (highResMode) null else {
-                val recorder = Recorder.Builder()
-                    .setQualitySelector(
-                        QualitySelector.from(
-                            videoQuality.quality,
-                            FallbackStrategy.higherQualityOrLowerThan(Quality.FHD)
-                        )
-                    )
-                    .build()
-                VideoCapture.Builder(recorder)
-                    .setTargetFrameRate(Range(videoFrameRate.fps, videoFrameRate.fps))
-                    .build()
-            }
-
             val baseSelector = CameraSelector.Builder()
                 .requireLensFacing(lensFacing)
                 .build()
@@ -2937,8 +4460,16 @@ fun CameraApp() {
             // 小米 / iQOO 上逻辑摄像头切不动副摄时，直接按 cameraId 绑定那颗头，
             // 等价于原厂 App 的"切镜头"。
             val lensId = boundLensId
+            // ⚠️ 这里原来也是用 physicalSwitchWorks 一刀切。
+            //    广角失败关掉总闸后，长焦头也会被判成"不走物理直连"，直接退回逻辑头。
+            //    改成按【这颗头自己是哪一类】判定。
+            val lensFactor: Float = if (lensId != null) {
+                (lensProfiles + physicalLensOptions)
+                    .filter { DeviceCompatibility.isRealCameraId(it.id) }
+                    .firstOrNull { it.id == lensId }?.zoomFactor ?: 1f
+            } else 1f
             val usePhysical = lensId != null &&
-                    physicalSwitchWorks &&
+                    physicalPathOpen(lensFactor) &&
                     DeviceCompatibility.isRealCameraId(lensId)
             // 局部变量收窄，避免用 !! 强制解包
             val targetId: String? = if (usePhysical) lensId else null
@@ -2951,40 +4482,213 @@ fun CameraApp() {
                 }
             } else baseSelector
 
-            provider.unbindAll()
+            // ★长焦头常见坑③：主摄那套分辨率它不接受★
+            // iQOO 10 Pro 的长焦只有 14.6MP，真我 GT5 Pro 的潜望也不吃 VideoCapture 的
+            // 4K + 三流共存，拿主摄探出来的最大 JPEG 去绑，CameraX 会抛
+            // "No supported surface combination"。
+            // 老代码只试 2 档就 physicalSwitchWorks = false 永久封杀 —— 长焦再也调不出来。
+            // 现在按「带不带录像流 × 带不带分辨率约束」四档降级，只有全败才认输。
+            val physMaxJpeg: Size? = if (targetId != null) {
+                physicalLensOptions.firstOrNull { it.id == targetId }
+                    ?.let {
+                        if (it.maxJpegW > 0 && it.maxJpegH > 0) Size(it.maxJpegW, it.maxJpegH)
+                        else null
+                    }
+            } else null
+            if (targetId != null) {
+                Log.d(
+                    "Camera",
+                    "物理头 $targetId JPEG 上限=" +
+                            "${physMaxJpeg?.width ?: "?"}x${physMaxJpeg?.height ?: "?"}" +
+                            "（逻辑头最大 ${maxPhotoPixels}px）"
+                )
+                // UI 上高像素数字要跟着这颗头走，别再显示主摄的 5000 万
+                physMaxJpeg?.let { maxPhotoPixels = it.width * it.height }
+            }
+
             var bound = false
+            // 成功绑定的那个 Preview，绑定完成后要把 surface 再贴一次（见下方说明）
+            var boundPreview: Preview? = null
 
-            if (vc != null) {
-                try {
-                    camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, ic, vc)
-                    imageCapture = ic
-                    videoCapture = vc
-                    bound = true
-                } catch (e: Exception) {
-                    Log.w("Camera", "三流绑定失败", e)
+            // ★切物理头前改用 TextureView（COMPATIBLE）★
+            // 这是"切到超广角后直接不显示画面"的根因之一：
+            //   PreviewView 默认 PERFORMANCE(SurfaceView)。SurfaceView 的 Surface 尺寸是
+            //   创建时按【当前 cameraId 的预览分辨率】定死的；切到物理超广角头后分辨率变了，
+            //   部分 ROM（华为 P / 红米 Note / OPPO Find 都有反馈）不会重新 request surface，
+            //   surface 一直停在旧尺寸上 —— 相机还在出帧，画面却永远贴不上去。
+            //   TextureView 没有这个限制，分辨率变了会自己重新布局。
+            // 代价是多一次纹理拷贝，所以只在真要换物理头时切，切回逻辑头再切回来省电。
+            if (usePhysical) {
+                if (pv.implementationMode != PreviewView.ImplementationMode.COMPATIBLE) {
+                    Log.d("Camera", "切物理头：PreviewView 切到 COMPATIBLE(TextureView) 避免 surface 不重建")
+                    pv.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                }
+            } else {
+                // 回到逻辑摄像头：恢复 PERFORMANCE(SurfaceView)，省一次纹理上传
+                if (pv.implementationMode != PreviewView.ImplementationMode.PERFORMANCE) {
+                    pv.implementationMode = PreviewView.ImplementationMode.PERFORMANCE
                 }
             }
 
-            if (!bound) {
+            // (带 VideoCapture, 带分辨率约束)
+            val plans: List<Pair<Boolean, Boolean>> = if (usePhysical)
+                listOf(true to true, true to false, false to true, false to false)
+            else listOf(true to true, false to true)
+
+            for ((withVideo, withResolution) in plans) {
                 try {
                     provider.unbindAll()
-                    camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, ic)
-                    imageCapture = ic
-                    videoCapture = null
+                    val pvUse = newPreview(withResolution)
+
+                    val icUse = ImageCapture.Builder()
+                        .apply {
+                            // 物理头：不锁主摄尺寸，让 CameraX 按这颗头自己的能力挑
+                            // （默认就是这颗头支持的最大/最优，等价于原厂切镜头）
+                            if (withResolution && physMaxJpeg == null) {
+                                setResolutionSelector(resolutionSelector)
+                            }
+                            setCaptureMode(
+                                if (highResMode) ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY
+                                else ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
+                            )
+                        }
+                        .build()
+
+                    val vcUse = if (withVideo && !highResMode) {
+                        val recorder = Recorder.Builder()
+                            .setQualitySelector(
+                                QualitySelector.from(
+                                    videoQuality.quality,
+                                    FallbackStrategy.higherQualityOrLowerThan(Quality.FHD)
+                                )
+                            )
+                            .build()
+                        VideoCapture.Builder(recorder)
+                            .setTargetFrameRate(Range(videoFrameRate.fps, videoFrameRate.fps))
+                            .build()
+                    } else null
+
+                    camera = if (vcUse != null) {
+                        provider.bindToLifecycle(lifecycleOwner, selector, pvUse, icUse, vcUse)
+                    } else {
+                        provider.bindToLifecycle(lifecycleOwner, selector, pvUse, icUse)
+                    }
+                    imageCapture = icUse
+                    videoCapture = vcUse
                     bound = true
+                    boundPreview = pvUse
+                    Log.d(
+                        "Camera",
+                        "绑定成功：物理头=${targetId ?: "逻辑"} " +
+                                "视频流=$withVideo 分辨率约束=$withResolution"
+                    )
+                    break
                 } catch (e: Exception) {
-                    Log.e("Camera", "两流绑定也失败", e)
+                    Log.w(
+                        "Camera",
+                        "绑定失败（物理头=${targetId ?: "逻辑"} " +
+                                "视频流=$withVideo 分辨率约束=$withResolution）",
+                        e
+                    )
                 }
             }
 
-            // 物理头单独打开失败（部分 ROM 不允许）→ 永久关掉这条路径，退回逻辑摄像头
+            // ★绑定完成后把 surface 再贴一次★
+            // 切镜头（尤其是切到物理超广角头）时，部分 ROM 上 PreviewView 不会主动
+            // 重新请求 surface，相机其实一直在出帧，只是画面贴不到屏幕上。
+            // 重新 setSurfaceProvider 会强制走一遍"请求 surface → 出帧"，
+            // 是 CameraX 社区针对这个现象的通用 workaround。
+            // 物理头多等一会儿：它的流起得比逻辑头慢，贴太早会被后续 unbind 冲掉。
+            if (bound) {
+                val settle = if (usePhysical) DeviceCompatibility.zoomSettleDelayMs else 0L
+                launch {
+                    delay(settle + 120L)
+                    try {
+                        boundPreview?.setSurfaceProvider(pv.surfaceProvider)
+                        Log.d("Camera", "已重新贴附预览 surface（物理头=${targetId ?: "逻辑"}）")
+                    } catch (e: Exception) {
+                        Log.w("Camera", "重新贴附预览 surface 失败", e)
+                    }
+                }
+            }
+
+            // ★物理头出流校验★
+            // 绑上了 ≠ 有画面。部分机型物理头能 bindToLifecycle 成功，
+            // 但预览流一直起不来（surface 贴不上 / HAL 不给帧），表现就是黑屏。
+            // CameraX 的 PreviewView 会自己暴露预览流状态（IDLE / STREAMING），
+            // 拿它做判据：超时还没 STREAMING 就判定这次物理直连失败，
+            // 立刻退回逻辑摄像头，改由 setZoomRatio 去到目标倍率。
+            if (bound && usePhysical) {
+                val streamed = waitForPreviewStream(pv, PHYSICAL_STREAM_TIMEOUT_MS)
+                if (!streamed) {
+                    val thatFactor = (lensProfiles + physicalLensOptions)
+                        .firstOrNull { it.id == targetId }?.zoomFactor ?: 1f
+                    if (thatFactor < 0.95f) {
+                        physicalWideWorks = false
+                        Log.w("Camera", "物理广角头 $targetId 无预览流，已封禁该路径（长焦不受影响）")
+                    } else if (thatFactor >= DeviceCompatibility.TELE_ENTER_RATIO) {
+                        // ★长焦无预览流：只封长焦，广角照旧★
+                        teleBindFailCount++
+                        Log.w("Camera", "长焦头 $targetId 无预览流（第 $teleBindFailCount 次）")
+                        if (teleBindFailCount >= DeviceCompatibility.TELE_BIND_FAIL_LIMIT) {
+                            telePreferPhysical = false
+                            physicalTeleWorks = false
+                            Log.w("Camera", "长焦连续无预览流 $teleBindFailCount 次，已禁用（广角不受影响）")
+                        }
+                    } else {
+                        Log.w("Camera", "物理头 $targetId 无预览流")
+                    }
+                    // 退回逻辑摄像头：重绑后由 pendingZoomTarget 把倍率接上
+                    pendingZoomTarget = pendingZoomTarget.takeIf { it > 0f } ?: displayedRatio
+                    lensSwitching = true
+                    boundLensId = null
+                    return@LaunchedEffect
+                }
+            }
+
+            // 四档全败：这台机器大概率不允许单独开物理头。
+            // ⚠️ 原来是"一次失败就 telePreferPhysical = false 永久封禁" ——
+            //    这是 OPPO Find 调不出长焦的成因③：绑定失败的原因可能是临时的
+            //    （录制刚结束、分辨率瞬时冲突、HAL 忙），一次就封死等于这台机器
+            //    这辈子都用不上物理长焦。改成累计 2 次才封。
             if (!bound && usePhysical) {
-                physicalSwitchWorks = false
-                Log.w("Camera", "物理头 $lensId 无法单独打开，已禁用物理直连")
+                // ⚠️ 原来这里无条件 physicalSwitchWorks = false 关总闸，见 [physicalPathOpen] 的说明
+                val isTeleTarget = (lensProfiles + physicalLensOptions)
+                    .firstOrNull { it.id == lensId }?.zoomFactor
+                    ?.let { it >= DeviceCompatibility.TELE_ENTER_RATIO } ?: false
+                if (isTeleTarget) {
+                    // ★长焦失败只封长焦★：广角直连不受影响，别一刀切
+                    teleBindFailCount++
+                    Log.w("Camera", "长焦头 $lensId 绑定失败（第 $teleBindFailCount 次）")
+                    if (teleBindFailCount >= DeviceCompatibility.TELE_BIND_FAIL_LIMIT) {
+                        telePreferPhysical = false
+                        physicalTeleWorks = false
+                        Log.w("Camera", "长焦直连连续失败 $teleBindFailCount 次，已禁用该路径（广角不受影响）")
+                    }
+                } else {
+                    // 广角 / 其它头失败：只封对应的那条路，长焦照旧可用
+                    val thatFactor2 = (lensProfiles + physicalLensOptions)
+                        .firstOrNull { it.id == lensId }?.zoomFactor ?: 1f
+                    if (thatFactor2 < 0.95f) {
+                        physicalWideWorks = false
+                        Log.w("Camera", "物理广角头 $lensId 四档绑定全失败，已封禁（长焦不受影响）")
+                    } else {
+                        physicalSwitchWorks = false
+                        Log.w("Camera", "物理头 $lensId 四档绑定全失败，已封禁该头（广角/长焦不受影响）")
+                    }
+                }
                 try {
                     provider.unbindAll()
-                    camera = provider.bindToLifecycle(lifecycleOwner, baseSelector, preview, ic)
-                    imageCapture = ic
+                    val pvBack = newPreview(true)
+                    val icBack = ImageCapture.Builder()
+                        .setResolutionSelector(resolutionSelector)
+                        .setCaptureMode(
+                            if (highResMode) ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY
+                            else ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY
+                        )
+                        .build()
+                    camera = provider.bindToLifecycle(lifecycleOwner, baseSelector, pvBack, icBack)
+                    imageCapture = icBack
                     videoCapture = null
                     bound = true
                 } catch (e2: Exception) {
@@ -3004,9 +4708,37 @@ fun CameraApp() {
                 } else null
                 if (actualId == lensId) {
                     Log.d("Camera", "★物理头直连成功: $lensId★")
+                    // 成功了就把失败计数清零，避免偶发失败被累计成永久封禁
+                    teleBindFailCount = 0
                 } else {
-                    physicalSwitchWorks = false
-                    Log.w("Camera", "物理头直连未生效（实际开的是 $actualId），已禁用该路径")
+                    // ★按类型封★：广角被静默忽略不该连坐封掉长焦
+                    val thatFactor3 = (lensProfiles + physicalLensOptions)
+                        .firstOrNull { it.id == lensId }?.zoomFactor ?: 1f
+                    when {
+                        thatFactor3 < 0.95f -> {
+                            physicalWideWorks = false
+                            Log.w(
+                                "Camera",
+                                "广角头 $lensId 直连未生效（实际开的是 $actualId），已封禁广角路径（长焦不受影响）"
+                            )
+                        }
+                        thatFactor3 >= DeviceCompatibility.TELE_ENTER_RATIO -> {
+                            teleBindFailCount++
+                            Log.w(
+                                "Camera",
+                                "长焦头 $lensId 直连未生效（实际开的是 $actualId，第 $teleBindFailCount 次）"
+                            )
+                            if (teleBindFailCount >= DeviceCompatibility.TELE_BIND_FAIL_LIMIT) {
+                                telePreferPhysical = false
+                                physicalTeleWorks = false
+                                Log.w("Camera", "长焦直连连续失败，已禁用（广角不受影响）")
+                            }
+                        }
+                        else -> {
+                            physicalSwitchWorks = false
+                            Log.w("Camera", "物理头 $lensId 直连未生效（实际开的是 $actualId）")
+                        }
+                    }
                 }
             }
 
@@ -3014,13 +4746,16 @@ fun CameraApp() {
             // 所以走 Camera2Interop 直接下发 CONTROL_VIDEO_STABILIZATION_MODE。
             // 同时打开光学防抖(OIS)，iQOO 15 这类机器有独立的 OIS 马达。
             stabilizationSupported = DeviceCompatibility.isVideoStabilizationSupported(context, camera)
-            applyStabilization(videoStabilization)
+            // 统一参数包：帧率 + 降噪 + 边缘 + 防抖一次下发（避免互相覆盖）
+            applySceneParams()
 
-            when (flashMode) {
-                0 -> ic.flashMode = ImageCapture.FLASH_MODE_OFF
-                1 -> ic.flashMode = ImageCapture.FLASH_MODE_AUTO
-                2 -> ic.flashMode = ImageCapture.FLASH_MODE_ON
-                3 -> ic.flashMode = ImageCapture.FLASH_MODE_OFF
+            // 绑定块里的 ic 局部变量已随分级降级改造移除，这里统一用 imageCapture 状态
+            imageCapture?.let { ic ->
+                ic.flashMode = when (flashMode) {
+                    1 -> ImageCapture.FLASH_MODE_AUTO
+                    2 -> ImageCapture.FLASH_MODE_ON
+                    else -> ImageCapture.FLASH_MODE_OFF
+                }
             }
 
             manualControlSupported = DeviceCompatibility.isManualControlAllowed(context, camera)
@@ -3037,7 +4772,15 @@ fun CameraApp() {
                     // 等于宣称"没有广角"。代码里到处是 coerceIn(minRatio, ...)，
                     // 用户点 0.6x 会被直接 clamp 回 1.0 —— 这就是广角调不出来的直接原因。
                     // 只要探测到确实存在更广的光学档位，就强制把下限放宽到那个档位。
-                    val opticalMin: Float? = opticalStops.filter { it > 0f }.minOrNull()
+                    // 同时参考【真实物理头】的倍率：光学档位探测失败时 opticalStops 可能是空的，
+                    // 但 physicalLensOptions 里那颗真实超广角头是实打实存在的
+                    val realWide: Float? = physicalLensOptions
+                        .filter { DeviceCompatibility.isRealCameraId(it.id) }
+                        .filter { it.zoomFactor in 0.2f..0.95f }
+                        .minByOrNull { it.zoomFactor }?.zoomFactor
+                    val opticalMin: Float? = listOfNotNull(
+                        opticalStops.filter { it > 0f }.minOrNull(), realWide
+                    ).minOrNull()
                     val finalMin: Float =
                         if (opticalMin != null && opticalMin < mn - 0.01f) opticalMin else mn
                     if (finalMin < mn) {
@@ -3047,13 +4790,38 @@ fun CameraApp() {
                         )
                     }
                     minZoomRatio = finalMin
-                    maxZoomRatio = mx
+                    halMaxZoomRatio = mx
+                    maxZoomRatio = zoomCapFor(mx)
 
                     // ★检测"HAL 撒谎"★
                     // mn 是 HAL 原生上报的下限。它 >= 1.0 说明逻辑头根本不接受 <1.0 的倍率，
                     // 但本机光学档位里确实有 0.6x —— 那这个广角只能靠物理直连才拿得到。
                     val hasWideOptic: Boolean = opticalStops.any { it < 0.95f }
-                    val blocked: Boolean = mn >= 0.99f && hasWideOptic
+                    // ★本机是否真有一颗"能独立打开"的广角头★
+                    // 光"存在广角"不够：它必须在 cameraIdList 里，否则 CameraX 绑不上。
+                    val hasBindableWide: Boolean = physicalLensOptions.any {
+                        DeviceCompatibility.isRealCameraId(it.id) &&
+                                DeviceCompatibility.canBindDirectly(it.id) &&
+                                it.zoomFactor in 0.2f..0.95f
+                    }
+                    // ★红米 Note 数字系列 / OPPO Find★：实测逻辑头 setZoomRatio(0.6) 完全无效，
+                    // 直接判定"广角必须走物理直连"，省掉一次注定失败的下发 + 校验。
+                    //
+                    // ⚠️ 但只有在【真的有可直连的广角头】时才这么判：
+                    //    Find X7 逻辑头下限是 0.7x（本身就是超广角在工作），
+                    //    而超广角物理头不在 cameraIdList 里绑不上 ——
+                    //    强制走物理直连只会失败并永久封禁，0.6x 反而彻底用不了。
+                    //    这种情况就该让逻辑头接手（能到 0.7x，已经是最广）。
+                    val blocked: Boolean = hasWideOptic &&
+                            (mn >= 0.99f ||
+                                    (DeviceCompatibility.preferPhysicalWide && hasBindableWide))
+                    if (DeviceCompatibility.preferPhysicalWide && !hasBindableWide && mn < 0.99f) {
+                        Log.w(
+                            "Camera",
+                            "本机标记为'广角需物理直连'，但没有可独立打开的广角头，" +
+                                    "改由逻辑摄像头承担（下限 ${mn}x）"
+                        )
+                    }
                     if (blocked != logicWideBlocked) {
                         logicWideBlocked = blocked
                         Log.w(
@@ -3080,6 +4848,8 @@ fun CameraApp() {
             merged.addAll(opticalStops)
             merged.addAll(defaultStops)
             merged.add(minZoomRatio)
+            // ★原相机焦段也生成按键★：原厂 App 上有的档位，这里就应该有
+            merged.addAll(vendorStops)
             // 最大数码变焦也补一个档位，但只在合理范围内。
             // iQOO 15 这类机器 zoomState 会报 100x，做成按钮没意义还挤爆一排。
             if (maxZoomRatio <= MAX_USEFUL_STOP) merged.add(maxZoomRatio)
@@ -3103,7 +4873,13 @@ fun CameraApp() {
             // 物理头直连时不做标定：标定是靠"逻辑摄像头的 zoomState"反推 linearZoom，
             // 单颗物理头没有多摄切换，标定出来的表是错的，还会把倍率搞乱。
             if (!hasCalibrated && lensFacing == CameraSelector.LENS_FACING_BACK && boundLensId == null) {
-                val cam = camera ?: return@LaunchedEffect
+                // 提前返回前必须复位：否则切换遮罩永远盖着，看起来就是"不显示画面"
+                val cam = camera
+                if (cam == null) {
+                    lensSwitching = false
+                    scanDone = true
+                    return@LaunchedEffect
+                }
                 // 标定单独用一个更短的等待，并且轮询 zoomState 提前结束：
                 // 以前每档都死等 zoomSettleDelayMs（最多 700ms），6 个档位就是 4 秒多。
                 // 现在多数档位 100~200ms 就到位了，整体能快一半以上。
@@ -3171,10 +4947,18 @@ fun CameraApp() {
             //     下发 setZoomRatio(全局目标 ÷ 0.6) 即可，UI 上仍显示 0.6x。
             val lid = boundLensId
             if (lid != null) {
-                val factor: Float =
-                    lensProfiles.firstOrNull { it.id == lid }?.zoomFactor ?: 1f
+                // 用合并池查倍率：物理头 id 来自 physicalLensOptions，
+                // 只查 lensProfiles 会兜底成 1f，长焦头就被当成 1x 数码变焦了
+                val factor: Float = (lensProfiles + physicalLensOptions)
+                    .filter { DeviceCompatibility.isRealCameraId(it.id) }
+                    .firstOrNull { it.id == lid }?.zoomFactor ?: 1f
                 val target = pendingZoomTarget
                 if (target > 0f) {
+                    // 潜望 / 长焦收敛更慢（马达行程 + 重新对焦），绑上来立刻下发会被 HAL 吞掉，
+                    // 表现就是"切到 3x 后画面还停在 1x"。这里多等一会儿再落位。
+                    if (factor >= DeviceCompatibility.TELE_ENTER_RATIO) {
+                        delay(DeviceCompatibility.teleSettleDelayMs)
+                    }
                     val local: Float = (target / factor).coerceAtLeast(1f)
                     camera?.cameraControl?.setZoomRatio(local)
                     displayedRatio = target
@@ -3217,12 +5001,14 @@ fun CameraApp() {
             }
 
             scanDone = true
+            lensSwitching = false
 
             if (mode == CaptureMode.PRO && manualControlSupported) {
                 delay(DeviceCompatibility.manualSettleDelayMs)
                 applyProParams(proIso, proShutterNs, proEv, proFocus, proWb)
             }
         } catch (e: Exception) {
+            lensSwitching = false
             Log.e("Camera", "相机绑定流程异常", e)
             e.printStackTrace()
         }
@@ -3252,7 +5038,10 @@ fun CameraApp() {
                 if (boundLensId == null) {
                     val (mn, mx) = normalizeZoomRange(it.minZoomRatio, it.maxZoomRatio)
                     if (mn != minZoomRatio) minZoomRatio = mn
-                    if (mx != maxZoomRatio) maxZoomRatio = mx
+                    if (mx != halMaxZoomRatio) {
+                        halMaxZoomRatio = mx
+                        maxZoomRatio = zoomCapFor(mx)
+                    }
                 }
 
                 // ★变焦动画进行中就不要插手★
@@ -3265,7 +5054,12 @@ fun CameraApp() {
                     val global: Float = it.zoomRatio * boundLensFactor()
                     currentRatio = global
                     if (!isDragging && (zoomJob == null || zoomJob?.isActive == false)) {
-                        if (global <= maxRatio * 1.05f) {
+                        // ★扩展数码变焦期间保持用户请求的目标★
+                        // HAL 会把倍率 clamp 到它自己的上限（比如只能到 10x），
+                        // 而用户点的是 50x，此时不能拿回读值覆盖 UI，否则倍率会被拽回去。
+                        if (boostTarget > 0f) {
+                            displayedRatio = boostTarget
+                        } else if (global <= maxRatio * 1.05f) {
                             displayedRatio = global
                         }
                     }
@@ -3287,9 +5081,22 @@ fun CameraApp() {
         }
     }
 
-    // 录像防抖：开关或模式变化时重新下发，不重新绑定相机
-    LaunchedEffect(videoStabilization, mode, camera) {
-        applyStabilization(videoStabilization)
+    // 防抖 / 帧率 / 降噪：开关、帧率或模式变化时重新下发统一参数包，不重新绑定相机
+    LaunchedEffect(videoStabilization, videoFrameRate, mode, camera) {
+        applySceneParams()
+    }
+
+    // ★照片 50x / 录像 15x★：模式切换时重算 UI 倍率上限（不重新绑定相机）
+    LaunchedEffect(mode, halMaxZoomRatio) {
+        val cap = zoomCapFor(halMaxZoomRatio)
+        if (cap != maxZoomRatio) maxZoomRatio = cap
+        if (displayedRatio > maxZoomRatio) {
+            val c = maxZoomRatio
+            camera?.cameraControl?.setZoomRatio(clampForHal(c))
+            displayedRatio = c
+            currentRatio = c
+            selectedZoom = nearestStop(c)
+        }
     }
 
     // 拖动变焦没有明确的"结束"回调，这里靠超时检测：
@@ -3340,10 +5147,24 @@ fun CameraApp() {
     fun smoothZoomTo(targetRatio: Float) {
         val cam = camera ?: return
         if (!scanDone) return
+        // 超过 HAL 上限的部分走扩展数码变焦：记下用户真正想要的目标
+        boostTarget = if (targetRatio > halMaxZoomRatio + 0.01f) targetRatio else 0f
         // 只有在【实测坐实】逻辑头到不了广角时才换物理头。
         // ⚠️ 这里曾经无条件调用 requestLensSwitchIfNeeded，等于每次变焦都先尝试直连，
         //    结果把本来 setZoomRatio 能正常工作的机型搞坏了。现在严格限定条件。
-        if (logicWideBlocked && targetRatio < 0.99f && boundLensId == null) {
+        val wantWide = logicWideBlocked && physicalWideWorks && targetRatio < 0.99f
+        // 统一用 pickTeleFor（容差与 requestLensSwitchIfNeeded 完全一致，避免两边判定打架）
+        val teleForTarget: DeviceCompatibility.LensProfile? = pickTeleFor(targetRatio)
+        val wantTele = teleForTarget != null && teleForTarget.id != boundLensId
+        // ★★卡在当前物理头上时必须换头★★
+        // ⚠️ 这是 Find X7 上 10x 失效的根因：
+        //    从 0.6x（直连广角头）点 10x 时，wantWide=false（10 >= 0.99）、wantTele=null，
+        //    于是根本不会调用 requestLensSwitchIfNeeded ——
+        //    停在那颗广角头上，endRatio 被 effMaxZoom()（0.6×4=2.4）夹成 2.4x。
+        //    表现就是"点 10x 只到 2.4x / 完全没反应"。
+        val stuckOnLens: Boolean = boundLensId != null &&
+                (targetRatio > effMaxZoom() + 0.01f || targetRatio < effMinZoom() - 0.01f)
+        if (wantWide || wantTele || stuckOnLens) {
             if (requestLensSwitchIfNeeded(targetRatio)) return
         }
         val endRatio = targetRatio.coerceIn(effMinZoom(), effMaxZoom())
@@ -3352,7 +5173,7 @@ fun CameraApp() {
         zoomJob?.cancel()
         zoomJob = coroutineScope.launch {
             if (abs(startRatio - endRatio) < 0.005f) {
-                cam.cameraControl.setZoomRatio(localZoomOf(endRatio))
+                cam.cameraControl.setZoomRatio(clampForHal(endRatio))
                 displayedRatio = endRatio
                 return@launch
             }
@@ -3361,8 +5182,10 @@ fun CameraApp() {
             // EIS 每帧做运动估计、OIS 驱动马达位移，而变焦会不断改变 crop region，
             // 两者同时进行时 HAL 每帧都要重算。所以变焦期间先挂起防抖，结束后再恢复。
             // 挂起之后 EIS 就不再参与，变焦的代价回到普通水平，可以放心用高频下发。
-            val stabWasOn = wantStabilization()
-            if (stabWasOn) setStabilizationRaw(false)
+            // ★变焦期间：防抖挂起 + AF 切连续视频对焦★
+            // EIS/OIS 与 crop 变化打架会卡；AF 每步重新寻焦则是"从大焦段切小焦段
+            // 一卡一卡"的另一半原因。两者一起处理，切换焦段就顺了。
+            applySceneParams(stabOverride = false, afSmooth = true)
 
             // 通知下面的轮询循环：变焦动画进行中，别来抢着更新 UI 状态
             zoomAnimating[0] = true
@@ -3393,18 +5216,20 @@ fun CameraApp() {
 
                     // ① 每帧都给相机下发——这个是顺滑感的来源，很便宜
                     //    物理头直连时要把全局倍率换算成这颗头的本地倍率
-                    cam.cameraControl.setZoomRatio(localZoomOf(r))
+                    cam.cameraControl.setZoomRatio(clampForHal(r))
 
                     // ② UI 状态只在攒够间隔时才提交——重组很贵，必须节流
                     val now = System.currentTimeMillis()
-                    if (step == steps || now - lastUiAt >= ZOOM_UI_REFRESH_MS) {
+                    val uiThrottle =
+                        if (isRecording) ZOOM_UI_REFRESH_MS_REC else ZOOM_UI_REFRESH_MS
+                    if (step == steps || now - lastUiAt >= uiThrottle) {
                         displayedRatio = r
                         lastUiAt = now
                         uiCommits++
                     }
                     delay(stepMs)
                 }
-                cam.cameraControl.setZoomRatio(localZoomOf(endRatio))
+                cam.cameraControl.setZoomRatio(clampForHal(endRatio))
                 displayedRatio = endRatio
                 Log.d("Camera", "变焦完成，UI 实际重组 $uiCommits 次（共 $steps 步）")
 
@@ -3414,7 +5239,11 @@ fun CameraApp() {
                 if (boundLensId == null && physicalSwitchWorks && !isFront) {
                     delay(DeviceCompatibility.zoomSettleDelayMs)
                     val actual: Float = cam.cameraInfo.zoomState.value?.zoomRatio ?: endRatio
-                    val off: Boolean = abs(actual - endRatio) > endRatio * 0.12f
+                    // 华为 P 系列按键与实际倍率对不上，这里把容差收紧一点；
+                    // 扩展数码变焦（目标超过 HAL 上限）是预期行为，不算"没到位"
+                    val tol: Float = if (DeviceCompatibility.isHuaweiPSeries) 0.08f else 0.12f
+                    val off: Boolean = abs(actual - endRatio) > endRatio * tol &&
+                            endRatio <= halMaxZoomRatio + 0.01f
                     Log.d(
                         "Camera",
                         "变焦校验: 目标 ${"%.2f".format(endRatio)}x → 实际 " +
@@ -3434,17 +5263,14 @@ fun CameraApp() {
                 // 否则轮询循环会永远不再更新倍率显示
                 zoomAnimating[0] = false
 
-                // 恢复防抖。专业模式下要走 applyProParams，
-                // 否则 setStabilizationRaw 会把手动参数清掉（它是全量替换）
-                if (stabWasOn) {
-                    // 先让 crop 落定再恢复 EIS，否则 EIS 一恢复就要
-                    // 重新收敛稳定窗口，画面会在变焦结束时又顿一下
-                    delay(STAB_RESTORE_DELAY_MS)
-                    if (mode == CaptureMode.PRO && manualControlSupported) {
-                        applyProParams(proIso, proShutterNs, proEv, proFocus, proWb)
-                    } else {
-                        setStabilizationRaw(true)
-                    }
+                // 恢复防抖与对焦模式。
+                // 录制中多等一会儿：EIS 刚恢复就要重新收敛稳定窗口，
+                // 紧接着的画面会顿一下 —— 那正是"录制时切焦段一卡一卡"的最后一环。
+                delay(if (isRecording) STAB_RESTORE_DELAY_MS_REC else STAB_RESTORE_DELAY_MS)
+                if (mode == CaptureMode.PRO && manualControlSupported) {
+                    applyProParams(proIso, proShutterNs, proEv, proFocus, proWb)
+                } else {
+                    applySceneParams()
                 }
             }
         }
@@ -3464,8 +5290,9 @@ fun CameraApp() {
 
         // 物理头直连时，把全局倍率换算成这颗头的本地倍率再下发
         val clamped = finalRatio.coerceIn(effMinZoom(), effMaxZoom())
+        boostTarget = if (clamped > halMaxZoomRatio + 0.01f) clamped else 0f
         displayedRatio = clamped
-        cam.cameraControl.setZoomRatio(localZoomOf(clamped))
+        cam.cameraControl.setZoomRatio(clampForHal(clamped))
         selectedZoom = nearestStop(clamped)
     }
 
@@ -3486,18 +5313,92 @@ fun CameraApp() {
         val cam = camera ?: return
         if (!scanDone) return
         val snapped = snapToOptical(ratio)
-        if (abs(snapped - ratio) > 0.001f) {
+        // 长焦档即使"没发生吸附"也要走一次 smoothZoomTo，否则换头逻辑永远不触发
+        val teleForSnap: DeviceCompatibility.LensProfile? = pickTeleFor(snapped)
+        val needSwitch = teleForSnap != null && teleForSnap.id != boundLensId
+        if (abs(snapped - ratio) > 0.001f || needSwitch) {
             smoothZoomTo(snapped)
         } else {
             val clamped = snapped.coerceIn(effMinZoom(), effMaxZoom())
-            cam.cameraControl.setZoomRatio(localZoomOf(clamped))
+            boostTarget = if (clamped > halMaxZoomRatio + 0.01f) clamped else 0f
+            cam.cameraControl.setZoomRatio(clampForHal(clamped))
             displayedRatio = clamped
         }
         selectedZoom = nearestStop(snapped)
     }
 
+    /**
+     * 成片后处理：① 扩展数码变焦的中心裁切 ② 苹果风格调色。
+     *
+     * 只在真的需要时才跑（boost > 1 或调色非中性），正常拍照完全不额外耗时。
+     * 失败也无所谓 —— 原图已经存好了，只是没做裁切 / 调色。
+     */
+    fun postProcessPhoto(uri: Uri, boost: Float, warmth: Float, tint: Float, intensity: Float) {
+        try {
+            val src = context.contentResolver.openInputStream(uri)?.use {
+                BitmapFactory.decodeStream(it, null, BitmapFactory.Options())
+            } ?: return
+            var out = src
+
+            // ① 扩展数码变焦：按取景框看到的范围做中心裁切，再放大回原尺寸
+            if (boost > 1.001f) {
+                val cw = (src.width / boost).roundToInt().coerceAtLeast(2)
+                val ch = (src.height / boost).roundToInt().coerceAtLeast(2)
+                val left = ((src.width - cw) / 2f).roundToInt()
+                val top = ((src.height - ch) / 2f).roundToInt()
+                val cropped = android.graphics.Bitmap.createBitmap(src, left, top, cw, ch)
+                out = android.graphics.Bitmap.createScaledBitmap(cropped, src.width, src.height, true)
+                Log.d("Camera", "扩展数码变焦 ${"%.1f".format(boost)}x 已裁切到 ${cw}x${ch}")
+            }
+
+            // ② 苹果风格调色：色温抬 R 压 B（或反过来），色调抬 G / 抬 R+B
+            if (intensity > 0f && (abs(warmth) > 0.5f || abs(tint) > 0.5f)) {
+                val k = (intensity / 100f).coerceIn(0f, 1f)
+                val w = warmth / 100f * k
+                val t = tint / 100f * k
+                val rGain = (1f + 0.18f * w) * (1f + 0.12f * t)
+                val gGain = 1f - 0.12f * t
+                val bGain = (1f - 0.18f * w) * (1f + 0.12f * t)
+                val dst = android.graphics.Bitmap.createBitmap(
+                    out.width, out.height,
+                    out.config ?: android.graphics.Bitmap.Config.ARGB_8888
+                )
+                val canvas = android.graphics.Canvas(dst)
+                val paint = android.graphics.Paint().apply {
+                    isAntiAlias = true
+                    colorFilter = android.graphics.ColorMatrixColorFilter(
+                        android.graphics.ColorMatrix(
+                            floatArrayOf(
+                                rGain, 0f, 0f, 0f, 0f,
+                                0f, gGain, 0f, 0f, 0f,
+                                0f, 0f, bGain, 0f, 0f,
+                                0f, 0f, 0f, 1f, 0f
+                            )
+                        )
+                    )
+                }
+                canvas.drawBitmap(out, 0f, 0f, paint)
+                out = dst
+            }
+
+            if (out !== src) {
+                context.contentResolver.openOutputStream(uri, "w")?.use { os ->
+                    out.compress(android.graphics.Bitmap.CompressFormat.JPEG, 95, os)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("Camera", "成片后处理失败（原图已保存）", e)
+        }
+    }
+
     fun takePhoto() {
         val ic = imageCapture ?: return
+        // 拍照瞬间把"扩展数码变焦倍数"和调色参数快照下来：
+        // 后处理在 IO 线程跑，等它跑完用户可能已经又变焦了
+        val boostSnapshot = digitalBoost
+        val wSnap = toneWarmth
+        val tSnap = toneTint
+        val iSnap = toneIntensity
         val name = "IMG_${System.currentTimeMillis()}.jpg"
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
@@ -3515,7 +5416,15 @@ fun CameraApp() {
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
                     val uri = outputFileResults.savedUri ?: return
-                    sessionMedia.add(0, CapturedMedia(uri, false, System.currentTimeMillis()))
+                    // 扩展数码变焦 / 调色：成片与取景框保持一致
+                    if (boostSnapshot > 1.001f ||
+                        (iSnap > 0f && (abs(wSnap) > 0.5f || abs(tSnap) > 0.5f))
+                    ) {
+                        coroutineScope.launch(Dispatchers.IO) {
+                            postProcessPhoto(uri, boostSnapshot, wSnap, tSnap, iSnap)
+                        }
+                    }
+                    sessionMedia.add(0, CapturedMedia(uri, false))
                 }
                 override fun onError(exception: ImageCaptureException) {
                     Log.e("Camera", "拍照失败", exception)
@@ -3558,7 +5467,7 @@ fun CameraApp() {
                     if (!event.hasError()) {
                         val uri = event.outputResults.outputUri
                         if (uri != Uri.EMPTY) {
-                            sessionMedia.add(0, CapturedMedia(uri, true, System.currentTimeMillis()))
+                            sessionMedia.add(0, CapturedMedia(uri, true))
                         }
                     }
                 }
@@ -3614,6 +5523,17 @@ fun CameraApp() {
 
     // 参数栏（像素 / 画质 / 帧率 / 防抖 / 比例 / 旋转 / 闪光 / 关于）的状态与回调。
     // 打包成一个对象，竖屏横排、横屏竖排两种布局共用同一份，避免两处逻辑不同步。
+    // 调色盘是否生效（有色偏才生效，正常拍照不做任何后处理）
+    val toneActive: Boolean =
+        toneIntensity > 0f && (abs(toneWarmth) > 0.5f || abs(toneTint) > 0.5f)
+    // 调色在预览上的近似呈现（成片由拍照后处理真实套用同样的色偏）
+    val toneOverlayColor: Color = if (!toneActive) Color.Transparent else Color(
+        red = (0.5f + 0.5f * (toneWarmth / 100f)).coerceIn(0f, 1f),
+        green = (0.5f - 0.4f * (toneTint / 100f)).coerceIn(0f, 1f),
+        blue = (0.5f - 0.5f * (toneWarmth / 100f) + 0.4f * (toneTint / 100f)).coerceIn(0f, 1f),
+        alpha = (0.10f * (toneIntensity / 100f)).coerceIn(0f, 0.16f)
+    )
+
     val settingsBarState = SettingsBarState(
         isFront = isFront,
         mode = mode,
@@ -3624,7 +5544,8 @@ fun CameraApp() {
         videoStabilization = videoStabilization,
         photoRatio = photoRatio,
         flashMode = flashMode,
-        autoRotate = autoRotate
+        autoRotate = autoRotate,
+        toneActive = toneActive
     )
     val settingsBarActions = SettingsBarActions(
         onHaptic = { haptic.performHapticFeedback(HapticFeedbackType.LongPress) },
@@ -3642,924 +5563,1349 @@ fun CameraApp() {
         onPhotoRatioChange = { photoRatio = it },
         onAutoRotateChange = { autoRotate = it },
         onFlashExpand = { flashExpanded = true },
-        onAbout = { showAbout = true }
+        onAbout = { showAbout = true },
+        onColorPalette = { showColorPalette = true },
+        onMenu = { menuPath = "" }
     )
 
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-
-        // 更新提示：Dialog 是独立窗口，放在这里不影响相机预览层级
-        updateInfo?.let { info ->
-            UpdateDialog(
-                info = info,
-                onDismiss = { updateInfo = null },
-                onSkip = {
-                    AppUpdate.skipVersion(context, info.versionCode)
-                    updateInfo = null
-                }
-            )
+    /**
+     * ★统一的"返回"★：按从上层到下层的顺序关掉浮层，
+     * 侧边返回手势和系统返回键都走这里，行为完全一致。
+     */
+    fun goBack() {
+        when {
+            showColorPalette -> showColorPalette = false
+            menuPath != null -> menuPath = null
+            flashExpanded -> flashExpanded = false
+            showReward -> showReward = false
+            showAbout -> showAbout = false
+            showGallery -> showGallery = false
+            showRuler -> showRuler = false
+            else -> (context as? ComponentActivity)?.finish()
         }
+    }
 
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer {
-                    rotationY = flipAngle
-                    cameraDistance = 12f * density
-                },
-            // 取景框按拍摄比例【居中】，框外露黑边。
-            // 横屏时的左移由 AndroidView 上的 offset 完成（用于平衡右侧三列控件），
-            // 这里的对齐必须保持 Center —— 改成 CenterStart 会让画面贴死左边缘。
-            contentAlignment = Alignment.Center
-        ) {
-            AndroidView(
-                modifier = Modifier
-                    .aspectRatio(previewRatio)
-                    // 横屏：在居中的基础上向左微调，平衡右侧"变焦+拍摄+模式栏"三列
-                    // 占掉的空间。只是微调，画面整体仍然居中。
-                    .offset(x = if (isLandscape) (-40).dp else 0.dp)
-                    .drawWithContent {
-                        if (isUltraWide) {
-                            drawContext.canvas.saveLayer(
-                                Rect(0f, 0f, size.width, size.height),
-                                ultraWidePaint
-                            )
-                            drawContent()
-                            drawContext.canvas.restore()
-                        } else {
-                            drawContent()
-                        }
-                    }
-                    .pointerInput(Unit) {
-                        detectTransformGestures { _, _, zoomChange, _ ->
-                            if (isFront) return@detectTransformGestures
-                            if (highResMode) return@detectTransformGestures
-                            val cam = camera ?: return@detectTransformGestures
-                            if (!scanDone) return@detectTransformGestures
-                            zoomJob?.cancel()
+    // ★切换遮罩看门狗★
+    // lensSwitching 为 true 时会在取景框上盖一层黑（遮住重绑瞬间比例跳动）。
+    // 如果绑定流程因任何原因没走到收尾（提前 return / 协程被取消），
+    // 这层黑就永远盖着 —— 表现正是"切到超广角后直接不显示画面"。
+    // 兜底：超过 4 秒还没收就强制收掉。宁可看到一瞬间的比例跳动，
+    // 也不能让用户对着一块黑屏。
+    LaunchedEffect(lensSwitching) {
+        if (!lensSwitching) return@LaunchedEffect
+        delay(4000)
+        if (lensSwitching) {
+            lensSwitching = false
+            Log.w("Camera", "镜头切换超时未收尾，已强制收起遮罩")
+        }
+    }
 
-                            // 拖动变焦期间同样挂起防抖，否则 EIS/OIS 与 crop 变化打架会卡。
-                            // 这里没有明确的"结束"回调，靠后面的超时检测恢复。
-                            if (wantStabilization() && !stabSuspended) {
-                                setStabilizationRaw(false)
-                                stabSuspended = true
-                            }
+    // 系统返回键 / 手势导航：跟侧边返回走同一套逻辑
+    BackHandler { goBack() }
 
-                            // ★节流★
-                            // detectTransformGestures 是按指针事件回调的，一秒能来 100+ 次。
-                            // 不节流的话，防抖开着时等于每秒重建上百次稳定窗口——必卡。
-                            // 挂起/录制时把间隔拉得更开，进一步减少 crop 变化次数。
-                            val now = System.currentTimeMillis()
-                            val throttle = when {
-                                isRecording -> DRAG_ZOOM_THROTTLE_REC_MS
-                                stabSuspended -> DRAG_ZOOM_THROTTLE_STAB_MS
-                                else -> DRAG_ZOOM_THROTTLE_MS
-                            }
-                            if (now - lastZoomApplyAt < throttle) {
-                                // 这次不下发，但把这次的缩放量累积起来，下次一起用，
-                                // 这样慢拖也不会丢操作（手感不会变"迟钝"）
-                                pendingZoomFactor *= zoomChange
-                                lastRulerInteraction = now
-                                return@detectTransformGestures
-                            }
-                            val factor = pendingZoomFactor * zoomChange
-                            pendingZoomFactor = 1f
-                            lastZoomApplyAt = now
+    // ★下发文字旋转角★：界面没跟着屏幕转时，UI 上的文字靠这个转正。
+    // 跟随旋转时是 0，等于什么都不做，不会有副作用。
+    CompositionLocalProvider(LocalLabelRotation provides labelRotationAnim) {
+        Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
 
-                            // 用 zoomRatio 而不是 linearZoom：后者依赖标定表，
-                            // 荣耀 50 SE 等机型标定不准会导致拖动无反应
-                            // 物理头直连时 zoomState 报的是本地倍率，乘光学倍率还原成全局倍率
-                            val curGlobal: Float =
-                                (cam.cameraInfo.zoomState.value?.zoomRatio
-                                    ?: localZoomOf(displayedRatio)) * boundLensFactor()
-                            val newRatio =
-                                (curGlobal * factor).coerceIn(effMinZoom(), effMaxZoom())
-                            cam.cameraControl.setZoomRatio(localZoomOf(newRatio))
-                            displayedRatio = newRatio
-                            selectedZoom = nearestStop(newRatio)
-                            lastRulerInteraction = now
-                        }
+            // ── 苹果风格调色盘 ──
+            if (showColorPalette) {
+                AppleColorPalette(
+                    warmth = toneWarmth,
+                    tint = toneTint,
+                    intensity = toneIntensity,
+                    onWarmthChange = { toneWarmth = it },
+                    onTintChange = { toneTint = it },
+                    onIntensityChange = { toneIntensity = it },
+                    onReset = {
+                        toneWarmth = 0f
+                        toneTint = 0f
+                        toneIntensity = 100f
                     },
-                factory = { ctx ->
-                    PreviewView(ctx).apply {
-                        scaleType = PreviewView.ScaleType.FILL_CENTER
-                        implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-                        previewViewRef = this
-                    }
-                },
-                update = { }
-            )
-        }
+                    landscape = relayoutLandscape,
+                    onClose = { showColorPalette = false }
+                )
+            }
 
-        if (flipAngle > 0.5f) {
+            // 更新提示：Dialog 是独立窗口，放在这里不影响相机预览层级
+            updateInfo?.let { info ->
+                UpdateDialog(
+                    info = info,
+                    onDismiss = { updateInfo = null },
+                    onSkip = {
+                        AppUpdate.skipVersion(context, info.versionCode)
+                        updateInfo = null
+                    }
+                )
+            }
+
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = (flipAngle / 90f).coerceIn(0f, 1f)))
-            )
-        }
+                    .graphicsLayer {
+                        rotationY = flipAngle
+                        cameraDistance = 12f * density
+                    },
+                // 取景框按拍摄比例【居中】，框外露黑边。
+                // 横屏时的左移由 AndroidView 上的 offset 完成（用于平衡右侧三列控件），
+                // 这里的对齐必须保持 Center —— 改成 CenterStart 会让画面贴死左边缘。
+                contentAlignment = Alignment.Center
+            ) {
+                AndroidView(
+                    modifier = Modifier
+                        .aspectRatio(previewRatio)
+                        // ★扩展数码变焦★：HAL 上限之外的倍率用预览缩放补齐，
+                        // 拍照时按同比例做中心裁切，所以取景和成片完全一致。
+                        .graphicsLayer {
+                            scaleX = digitalBoost
+                            scaleY = digitalBoost
+                        }
+                        // 裁掉放大后溢出取景框的部分
+                        .clip(RoundedCornerShape(0.dp))
+                        // 横屏：在居中的基础上向左微调，平衡右侧"变焦+拍摄+模式栏"三列
+                        // 占掉的空间。只是微调，画面整体仍然居中。
+                        .offset(x = if (relayoutLandscape) (-40).dp else 0.dp)
+                        .drawWithContent {
+                            // 预览原样绘制，不再按焦段套滤镜（见上方 isUltraWide 处的说明）
+                            drawContent()
+                            // ★调色盘在预览上的近似呈现★
+                            // 真实色偏在成片上由后处理套用，这里只是让你在取景时就能看到色调走向
+                            if (toneActive) {
+                                drawRect(color = toneOverlayColor)
+                            }
+                        }
+                        .pointerInput(Unit) {
+                            detectTransformGestures { _, _, zoomChange, _ ->
+                                if (isFront) return@detectTransformGestures
+                                if (highResMode) return@detectTransformGestures
+                                val cam = camera ?: return@detectTransformGestures
+                                if (!scanDone) return@detectTransformGestures
+                                zoomJob?.cancel()
 
-        // ── 参数栏（像素 / 画质 / 帧率 / 防抖 / 比例 / 旋转 / 闪光 / 关于）──
-        // 竖屏：横排放在顶部。横屏：改到屏幕左边竖排（见下方横屏分支），
-        // 因为横屏时顶部那条很窄，参数挤在一排会压住取景框。
-        if (!isLandscape) {
-            SettingsChipsRow(
+                                // 拖动变焦期间同样挂起防抖，否则 EIS/OIS 与 crop 变化打架会卡。
+                                // 这里没有明确的"结束"回调，靠后面的超时检测恢复。
+                                if (wantStabilization() && !stabSuspended) {
+                                    setStabilizationRaw(false)
+                                    stabSuspended = true
+                                }
+
+                                // ★节流★
+                                // detectTransformGestures 是按指针事件回调的，一秒能来 100+ 次。
+                                // 不节流的话，防抖开着时等于每秒重建上百次稳定窗口——必卡。
+                                // 挂起/录制时把间隔拉得更开，进一步减少 crop 变化次数。
+                                val now = System.currentTimeMillis()
+                                val throttle = when {
+                                    isRecording -> DRAG_ZOOM_THROTTLE_REC_MS
+                                    stabSuspended -> DRAG_ZOOM_THROTTLE_STAB_MS
+                                    else -> DRAG_ZOOM_THROTTLE_MS
+                                }
+                                if (now - lastZoomApplyAt < throttle) {
+                                    // 这次不下发，但把这次的缩放量累积起来，下次一起用，
+                                    // 这样慢拖也不会丢操作（手感不会变"迟钝"）
+                                    pendingZoomFactor *= zoomChange
+                                    lastRulerInteraction = now
+                                    return@detectTransformGestures
+                                }
+                                val factor = pendingZoomFactor * zoomChange
+                                pendingZoomFactor = 1f
+                                lastZoomApplyAt = now
+
+                                // 用 zoomRatio 而不是 linearZoom：后者依赖标定表，
+                                // 荣耀 50 SE 等机型标定不准会导致拖动无反应
+                                // 物理头直连时 zoomState 报的是本地倍率，乘光学倍率还原成全局倍率
+                                val curGlobal: Float =
+                                    (cam.cameraInfo.zoomState.value?.zoomRatio
+                                        ?: localZoomOf(displayedRatio)) * boundLensFactor()
+                                val newRatio =
+                                    (curGlobal * factor).coerceIn(effMinZoom(), effMaxZoom())
+                                boostTarget =
+                                    if (newRatio > halMaxZoomRatio + 0.01f) newRatio else 0f
+                                cam.cameraControl.setZoomRatio(clampForHal(newRatio))
+                                displayedRatio = newRatio
+                                selectedZoom = nearestStop(newRatio)
+                                lastRulerInteraction = now
+                            }
+                        },
+                    factory = { ctx ->
+                        PreviewView(ctx).apply {
+                            scaleType = PreviewView.ScaleType.FILL_CENTER
+                            // ★性能优化★：只有"必须靠物理直连切镜头"的机型才用 COMPATIBLE
+                            // （TextureView），其余一律走 PERFORMANCE（SurfaceView）——
+                            // 后者的预览走独立合成层，省一次纹理上传，明显更流畅省电。
+                            implementationMode =
+                                if (DeviceCompatibility.isStubbornMultiCam)
+                                    PreviewView.ImplementationMode.COMPATIBLE
+                                else PreviewView.ImplementationMode.PERFORMANCE
+                            previewViewRef = this
+                        }
+                    },
+                    update = { }
+                )
+            }
+
+            // ★切换镜头时盖一层黑★：重绑会短暂改变预览分辨率，
+            // 取景框比例会跟着跳一下。遮住这一瞬间，就看不到"比例突然变一下"。
+            if (lensSwitching) {
+                Box(
+                    modifier = Modifier
+                        .aspectRatio(previewRatio)
+                        .offset(x = if (relayoutLandscape) (-40).dp else 0.dp)
+                        .clip(RoundedCornerShape(0.dp))
+                        .background(Color.Black)
+                )
+            }
+
+            if (flipAngle > 0.5f) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = (flipAngle / 90f).coerceIn(0f, 1f)))
+                )
+            }
+
+            // ── 参数栏（像素 / 画质 / 帧率 / 防抖 / 比例 / 旋转 / 闪光 / 关于）──
+            // 竖屏：横排放在顶部。横屏：改到屏幕左边竖排（见下方横屏分支），
+            // 因为横屏时顶部那条很窄，参数挤在一排会压住取景框。
+            if (!relayoutLandscape) {
+                SettingsChipsRow(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .statusBarsPadding()
+                        .padding(top = if (uiCompact) 6.dp else 12.dp),
+                    st = settingsBarState,
+                    act = settingsBarActions,
+                    hidden = hiddenChipIds,
+                    onHiddenChange = { hiddenChipIds = it }
+                )
+            }
+            // ── 闪光灯展开：全屏透明层，点任意地方关闭 ──
+            // 放在顶部栏之后绘制，所以它盖在下面所有控件之上；
+            // 选择面板再画在它之上，这样点面板上的图标不会被关掉。
+            if (flashExpanded) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.25f))
+                        .clickable(
+                            // 去掉点击水波纹，纯透明关闭层不该有反馈
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) {
+                            flashExpanded = false
+                        }
+                )
+            }
+
+            // ── 闪光灯选择面板：带弹出动画，叠在关闭层之上 ──
+            AnimatedVisibility(
+                visible = flashExpanded,
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .statusBarsPadding()
-                    .padding(top = 12.dp),
-                st = settingsBarState,
-                act = settingsBarActions
-            )
-        }
-        // ── 闪光灯展开：全屏透明层，点任意地方关闭 ──
-        // 放在顶部栏之后绘制，所以它盖在下面所有控件之上；
-        // 选择面板再画在它之上，这样点面板上的图标不会被关掉。
-        if (flashExpanded) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.25f))
-                    .clickable(
-                        // 去掉点击水波纹，纯透明关闭层不该有反馈
-                        indication = null,
-                        interactionSource = remember { MutableInteractionSource() }
-                    ) {
-                        flashExpanded = false
-                    }
-            )
-        }
-
-        // ── 闪光灯选择面板：带弹出动画，叠在关闭层之上 ──
-        AnimatedVisibility(
-            visible = flashExpanded,
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .statusBarsPadding()
-                .padding(top = 56.dp),
-            enter = fadeIn(tween(120)) + scaleIn(
-                animationSpec = spring(
-                    dampingRatio = Spring.DampingRatioMediumBouncy,
-                    stiffness = Spring.StiffnessMedium
+                    .padding(top = 56.dp),
+                enter = fadeIn(tween(120)) + scaleIn(
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                        stiffness = Spring.StiffnessMedium
+                    ),
+                    initialScale = 0.75f
                 ),
-                initialScale = 0.75f
-            ),
-            exit = fadeOut(tween(100)) + scaleOut(targetScale = 0.85f)
-        ) {
-            Row(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(22.dp))
-                    .background(Color.Black.copy(alpha = 0.75f))
-                    .border(1.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(22.dp))
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalAlignment = Alignment.CenterVertically
+                exit = fadeOut(tween(100)) + scaleOut(targetScale = 0.85f)
             ) {
-                for (m in 0..3) {
-                    // 图标逐个错开一点点出场，比整排一起弹出更有质感
-                    val appear = remember { Animatable(0f) }
-                    LaunchedEffect(flashExpanded) {
-                        if (flashExpanded) {
-                            appear.snapTo(0f)
-                            appear.animateTo(
-                                1f,
-                                spring(
-                                    dampingRatio = Spring.DampingRatioMediumBouncy,
-                                    stiffness = Spring.StiffnessMedium
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(Color.Black.copy(alpha = 0.75f))
+                        .border(1.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(22.dp))
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    for (m in 0..3) {
+                        // 图标逐个错开一点点出场，比整排一起弹出更有质感
+                        val appear = remember { Animatable(0f) }
+                        LaunchedEffect(flashExpanded) {
+                            if (flashExpanded) {
+                                appear.snapTo(0f)
+                                appear.animateTo(
+                                    1f,
+                                    spring(
+                                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                                        stiffness = Spring.StiffnessMedium
+                                    )
                                 )
+                            }
+                        }
+                        Box(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .graphicsLayer {
+                                    scaleX = appear.value
+                                    scaleY = appear.value
+                                    alpha = appear.value
+                                }
+                                .clip(CircleShape)
+                                .background(
+                                    if (flashMode == m) Color.White.copy(alpha = 0.25f)
+                                    else Color.Transparent
+                                )
+                                .border(
+                                    1.dp,
+                                    if (flashMode == m) Color(0xFFFFC107)
+                                    else Color.Transparent,
+                                    CircleShape
+                                )
+                                .clickable {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    flashMode = m
+                                    flashExpanded = false
+                                },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            FlashIcon(mode = m, selected = flashMode == m)
+                        }
+                    }
+                }
+            }
+
+            if (!scanDone) {
+                Box(
+                    modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.6f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("正在校准...", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            // ── 横屏：模式栏挪到左边、变焦挪到右边，中间整块留给取景框 ──
+            // 竖屏时这两块都堆在底部会糊在画面正中；横屏屏幕更矮，必须分开到两侧。
+            // ════════ 横屏布局 ════════
+            // 横屏屏幕"矮而宽"，顶部那一条很窄、中间要完整留给取景框，所以三块分开：
+            //   左边 = 参数栏（像素/画质/帧率/防抖/比例/旋转/闪光/关于），竖排
+            //   右边 = 模式切换 + 变焦（倍率+档位）+ 拍摄键，统一放进【同一个 Column】竖排
+            //   中间 = 取景框
+            // ★右边合成一个 Column 是关键★：以前模式栏、变焦栏、快门各自 align，
+            //   变焦档位一多就会盖住快门；放进同一个 Column 后按顺序排，永远不会重叠。
+            // ════════ 横屏布局（参照参考图的结构）════════
+            // 参考图（竖屏）的三块 → 横屏的对应位置：
+            //   参考图左下角的变焦档位(0.6/1x/2/5/10)  → 横屏【左侧】竖排
+            //   参考图顶部那排图标(闪光/滤镜/AI/设置)   → 横屏【右侧】竖排
+            //   参考图底部 相册|快门|切换 + 下方模式栏   → 横屏【底部】保持同样结构
+            // 中间整块留给取景框。
+            // ════════ 横屏布局 ════════
+            //   左侧 = 参数栏（像素/画质/帧率/防抖/比例/旋转/闪光/关于），竖排
+            //   右侧 = 变焦（当前倍率 + 档位），竖排
+            //   底部 = 相册 | 快门 | 切换，其下方是模式栏
+            //   中间 = 取景框
+            // 挖孔避让跟着【左侧那栏】走（挖孔通常在某一条长边上，左侧栏要往里推）。
+            if (relayoutLandscape) {
+                // ── 左侧：参数栏，竖排 ──
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .navigationBarsPadding()
+                        // 挖孔在左边时往里推，避免被前置摄像头挡住点不到
+                        // 基础留白 10.dp：比原来 12.dp 略收，但仍保证不至于贴在屏幕边缘
+                        .padding(start = 10.dp + cutoutLeftDp)
+                        // ★限高 + 滚动★：不设上限的话 Column 会被内容撑出屏幕，
+                        // 滚动也就无从谈起了
+                        .fillMaxHeight(0.9f),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    SettingsChipsColumn(
+                        st = settingsBarState,
+                        act = settingsBarActions,
+                        hidden = hiddenChipIds,
+                        onHiddenChange = { hiddenChipIds = it }
+                    )
+                }
+
+            }
+
+            // 竖屏：整块控制区在底部居中；横屏：挪到屏幕【右侧】垂直居中
+            // （参考图向左转 90° 后，原本在底部的东西都落到右边）
+            Column(
+                modifier = if (relayoutLandscape) {
+                    Modifier
+                        .align(Alignment.CenterEnd)
+                        .navigationBarsPadding()
+                        .padding(end = 14.dp)
+                } else {
+                    Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        // 横屏沿用竖屏布局时竖向很紧，底部留白收到 6dp
+                        .padding(bottom = if (uiCompact) 6.dp else 24.dp)
+                },
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                if (!isFront && !relayoutLandscape) {
+                    // ★变焦提示已取消★：原来这里有一行 "1.0x · 23mm 主摄" 的倍率 + 镜头标签，
+                    // 它把底部控制区又顶高了一截、还跟档位按钮上的倍率重复。现在只保留档位按钮。
+
+                    AnimatedVisibility(
+                        visible = showRuler,
+                        enter = expandVertically(
+                            expandFrom = Alignment.Bottom,
+                            animationSpec = tween(durationMillis = 320)
+                        ) + fadeIn(animationSpec = tween(durationMillis = 250)),
+                        exit = shrinkVertically(
+                            shrinkTowards = Alignment.Bottom,
+                            animationSpec = tween(durationMillis = 320)
+                        ) + fadeOut(animationSpec = tween(durationMillis = 200))
+                    ) {
+                        ZoomRuler(
+                            currentRatio = displayedRatio,
+                            // ★轮盘用【全局范围】，且在拖动开始前就退回逻辑摄像头★
+                            //
+                            // 不能用 effMinZoom()/effMaxZoom()：那是【当前这颗物理头】的可用区间
+                            // （如 3x 头只有 3~12x），传过去轮盘会被压缩成一小段 ——
+                            // 这就是"轮盘只有 0.7x 到 2.5x"的直接来源。
+                            //
+                            // 而"轮盘和倍率对不上"的真正原因是：直连物理头时下发的是本地倍率，
+                            // 拖到 1x 在 3x 头上等于原地不动。解决办法不是缩小轮盘，
+                            // 而是【拖动开始前先退回逻辑摄像头】—— 见下面的 onDragStateChange。
+                            minRatio = minRatio, maxRatio = maxRatio,
+                            onRatioChange = {
+                                lastRulerInteraction = System.currentTimeMillis()
+                                directSetRatio(it)
+                            },
+                            onDragStateChange = { dragging ->
+                                isDragging = dragging
+                                // 拖动全程走逻辑摄像头：它是唯一能覆盖完整全局范围的，
+                                // 这样轮盘每一个位置都对应真实倍率，不会"拖了不动"。
+                                // 松手时由 commitZoom 吸附到光学档，需要的话再直连物理头 ——
+                                // 这也正是原厂 App 的行为（拖动时数码、松手后切光学镜头）。
+                                if (dragging && boundLensId != null) {
+                                    Log.d(
+                                        "Camera",
+                                        "开始拖动变焦，先从物理头 ${boundLensId} 退回逻辑摄像头以保证全程可拖"
+                                    )
+                                    pendingZoomTarget = displayedRatio
+                                    lensSwitching = true
+                                    boundLensId = null
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth().height(105.dp),
+                            stops = zoomStops,
+                            onCommit = {
+                                lastRulerInteraction = System.currentTimeMillis()
+                                commitZoom(it)
+                            }
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Row(
+                        modifier = Modifier.pointerInput(Unit) {
+                            detectHorizontalDragGestures(
+                                onDragStart = {
+                                    showRuler = true
+                                    lastRulerInteraction = System.currentTimeMillis()
+                                }
+                            ) { change, _ ->
+                                change.consume()
+                                lastRulerInteraction = System.currentTimeMillis()
+                            }
+                        },
+                        verticalAlignment = Alignment.CenterVertically,
+                        // ★一行排开，档位之间只留一小段距离★
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        // 档位按钮 = 光学档位 ∪ 常用档位（2x 等没有物理头的档位保留，走数码变焦）
+                        zoomStops.forEach { zoom ->
+                            val isSelected = when {
+                                zoom == 2.0f && abs(selectedZoom - 3.5f) < 0.05f -> true
+                                abs(selectedZoom - zoom) < 0.05f -> true
+                                else -> false
+                            }
+                            // 这台机器到不了的档位（比如 HAL 没上报 0.6x 超广角）直接置灰。
+                            // ★真实存在的光学档位例外★：小米 / iQOO 上 zoomState 常只报 min=1.0，
+                            // 按范围过滤会把 0.6x 超广角按钮弄没 —— 点它时走"物理头直连"兜底。
+                            val isOptical = opticalStops.any { o -> abs(o - zoom) < 0.01f }
+                            val allowed = isOptical ||
+                                    (zoom >= minRatio - 0.01f && zoom <= maxRatio + 0.01f &&
+                                            // 高画质模式只允许真实光学档
+                                            (!highResMode || isOpticalStop(zoom)))
+
+                            ZoomButton(
+                                label = formatStop(zoom),
+                                isSelected = isSelected,
+                                enabled = scanDone && allowed,
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    onZoomButtonClick(zoom)
+                                }
                             )
                         }
                     }
+                    if (!relayoutLandscape) {
+                        Spacer(modifier = Modifier.height(if (uiCompact) 6.dp else 14.dp))
+                    }
+                } else if (!relayoutLandscape) {
+                    Spacer(modifier = Modifier.height(if (uiCompact) 6.dp else 14.dp))
+                }
+
+                // ── 专业模式参数区 ──
+                // ★横屏不再横铺★ 原来是 fillMaxWidth 的一整条，横屏时会横跨屏幕压住取景框。
+                // 现在抽成 lambda，竖屏照旧横铺在底部；横屏时塞进右侧那一竖条里，
+                // 和录像模式的横屏结构完全一致：左=设置栏，右=参数/变焦/快门/模式栏。
+                val proSection: @Composable (Boolean) -> Unit = { vertical ->
+                    if (mode == CaptureMode.PRO && !isFront && scanDone) {
+                        if (!manualControlSupported) {
+                            Box(
+                                modifier = Modifier
+                                    .then(
+                                        if (vertical) Modifier.width(150.dp)
+                                        else Modifier.fillMaxWidth()
+                                    )
+                                    .padding(
+                                        horizontal = if (vertical) 0.dp else 24.dp,
+                                        vertical = 8.dp
+                                    )
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(Color.Black.copy(alpha = 0.5f))
+                                    .padding(12.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    "此设备不支持手动控制",
+                                    color = Color(0xFFFFA000),
+                                    fontSize = 11.sp,
+                                    textAlign = TextAlign.Center,
+                                    // ★只旋转文字★
+                                    modifier = Modifier.rotate(LocalLabelRotation.current)
+                                )
+                            }
+                            if (!vertical) Spacer(modifier = Modifier.height(10.dp))
+                        } else {
+                            ProControls(
+                                vertical = vertical,
+                                proIso = proIso,
+                                onIsoChange = {
+                                    proIso = it
+                                    applyProParams(it, proShutterNs, proEv, proFocus, proWb)
+                                },
+                                proShutterNs = proShutterNs,
+                                onShutterChange = {
+                                    proShutterNs = it
+                                    applyProParams(proIso, it, proEv, proFocus, proWb)
+                                },
+                                proEv = proEv,
+                                onEvChange = {
+                                    proEv = it
+                                    applyProParams(proIso, proShutterNs, it, proFocus, proWb)
+                                },
+                                proFocus = proFocus,
+                                onFocusChange = {
+                                    proFocus = it
+                                    applyProParams(proIso, proShutterNs, proEv, it, proWb)
+                                },
+                                proWb = proWb,
+                                onWbChange = {
+                                    proWb = it
+                                    applyProParams(proIso, proShutterNs, proEv, proFocus, it)
+                                },
+                                onReset = {
+                                    proIso = 0
+                                    proShutterNs = 0L
+                                    proEv = 0
+                                    proFocus = -1f
+                                    proWb = 0
+                                    applyProParams(0, 0L, 0, -1f, 0)
+                                },
+                                activeParam = proActiveParam,
+                                onActiveParamChange = { proActiveParam = it }
+                            )
+                            if (!vertical) Spacer(modifier = Modifier.height(10.dp))
+                        }
+                    }
+                }
+
+                // 竖屏：参数区横铺在底部（保持原样）
+                if (!relayoutLandscape) proSection(false)
+
+
+                // 拍摄控制组（相册 / 快门 / 切换）。
+                // 横屏时竖排：参考图向左转 90° 后，底部横排的这三个键变成竖排。
+                val captureControls: @Composable () -> Unit = {
                     Box(
                         modifier = Modifier
-                            .size(40.dp)
-                            .graphicsLayer {
-                                scaleX = appear.value
-                                scaleY = appear.value
-                                alpha = appear.value
-                            }
-                            .clip(CircleShape)
-                            .background(
-                                if (flashMode == m) Color.White.copy(alpha = 0.25f)
-                                else Color.Transparent
-                            )
-                            .border(
-                                1.dp,
-                                if (flashMode == m) Color(0xFFFFC107)
-                                else Color.Transparent,
-                                CircleShape
-                            )
+                            .size(52.dp).clip(RoundedCornerShape(8.dp))
+                            .background(Color.White.copy(alpha = 0.15f))
+                            .clickable { showGallery = true },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (sessionMedia.isNotEmpty()) {
+                            SessionThumbnail(media = sessionMedia[0], modifier = Modifier.fillMaxSize())
+                        } else {
+                            Text("🖼", fontSize = 20.sp)
+                        }
+                    }
+
+                    // ★拍摄键常驻底部中央（跟参考图一致）★
+                    // 横屏也放在这里：参考图的快门就是底部居中，
+                    // 左侧变焦、右侧参数，中间底部留给快门和模式栏。
+                    ShutterButton(
+                        isVideoMode = mode == CaptureMode.VIDEO,
+                        isRecording = isRecording,
+                        landscape = relayoutLandscape,
+                        onVideoClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            if (isRecording) stopRecording() else startRecording()
+                        },
+                        onPhotoClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            takePhoto()
+                        }
+                    )
+
+                    Box(
+                        modifier = Modifier
+                            .size(52.dp).clip(CircleShape)
+                            .background(Color.White.copy(alpha = 0.15f))
                             .clickable {
+                                if (isFlipping) return@clickable
                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                flashMode = m
-                                flashExpanded = false
+                                showRuler = false
+                                isFlipping = true
+                                pendingLensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
+                                    CameraSelector.LENS_FACING_FRONT
+                                else
+                                    CameraSelector.LENS_FACING_BACK
+                                cameraReadyAfterSwitch = false
+
+                                coroutineScope.launch {
+                                    val dur = 220L
+                                    var t0 = System.currentTimeMillis()
+                                    while (true) {
+                                        val el = System.currentTimeMillis() - t0
+                                        val t = (el.toFloat() / dur).coerceIn(0f, 1f)
+                                        flipAngle = 90f * t
+                                        if (t >= 1f) break
+                                        delay(16)
+                                    }
+                                    // 切换前后摄时物理头直连状态作废，回到"逻辑摄像头 + 数码变焦"
+                                    boundLensId = null
+                                    pendingZoomTarget = 0f
+                                    lensFacing = pendingLensFacing
+                                    var wait = 0L
+                                    while (!cameraReadyAfterSwitch && wait < 3000) {
+                                        delay(16)
+                                        wait += 16
+                                    }
+                                    t0 = System.currentTimeMillis()
+                                    while (true) {
+                                        val el = System.currentTimeMillis() - t0
+                                        val t = (el.toFloat() / dur).coerceIn(0f, 1f)
+                                        flipAngle = 90f * (1f - t)
+                                        if (t >= 1f) break
+                                        delay(16)
+                                    }
+                                    flipAngle = 0f
+                                    isFlipping = false
+                                }
                             },
                         contentAlignment = Alignment.Center
                     ) {
-                        FlashIcon(mode = m, selected = flashMode == m)
+                        Text("🔄", fontSize = 22.sp)
                     }
                 }
-            }
-        }
 
-        if (!scanDone) {
-            Box(
-                modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.6f)),
-                contentAlignment = Alignment.Center
-            ) {
-                Text("正在校准...", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-            }
-        }
-
-        // ── 横屏：模式栏挪到左边、变焦挪到右边，中间整块留给取景框 ──
-        // 竖屏时这两块都堆在底部会糊在画面正中；横屏屏幕更矮，必须分开到两侧。
-        // ════════ 横屏布局 ════════
-        // 横屏屏幕"矮而宽"，顶部那一条很窄、中间要完整留给取景框，所以三块分开：
-        //   左边 = 参数栏（像素/画质/帧率/防抖/比例/旋转/闪光/关于），竖排
-        //   右边 = 模式切换 + 变焦（倍率+档位）+ 拍摄键，统一放进【同一个 Column】竖排
-        //   中间 = 取景框
-        // ★右边合成一个 Column 是关键★：以前模式栏、变焦栏、快门各自 align，
-        //   变焦档位一多就会盖住快门；放进同一个 Column 后按顺序排，永远不会重叠。
-        // ════════ 横屏布局（参照参考图的结构）════════
-        // 参考图（竖屏）的三块 → 横屏的对应位置：
-        //   参考图左下角的变焦档位(0.6/1x/2/5/10)  → 横屏【左侧】竖排
-        //   参考图顶部那排图标(闪光/滤镜/AI/设置)   → 横屏【右侧】竖排
-        //   参考图底部 相册|快门|切换 + 下方模式栏   → 横屏【底部】保持同样结构
-        // 中间整块留给取景框。
-        // ════════ 横屏布局 ════════
-        //   左侧 = 参数栏（像素/画质/帧率/防抖/比例/旋转/闪光/关于），竖排
-        //   右侧 = 变焦（当前倍率 + 档位），竖排
-        //   底部 = 相册 | 快门 | 切换，其下方是模式栏
-        //   中间 = 取景框
-        // 挖孔避让跟着【左侧那栏】走（挖孔通常在某一条长边上，左侧栏要往里推）。
-        if (isLandscape) {
-            // ── 左侧：参数栏，竖排 ──
-            Column(
-                modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .navigationBarsPadding()
-                    // 挖孔在左边时往里推，避免被前置摄像头挡住点不到
-                    // 基础留白 10.dp：比原来 12.dp 略收，但仍保证不至于贴在屏幕边缘
-                    .padding(start = 10.dp + cutoutLeftDp),
-                verticalArrangement = Arrangement.Center,
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                SettingsChipsColumn(st = settingsBarState, act = settingsBarActions)
-            }
-
-        }
-
-        // 竖屏：整块控制区在底部居中；横屏：挪到屏幕【右侧】垂直居中
-        // （参考图向左转 90° 后，原本在底部的东西都落到右边）
-        Column(
-            modifier = if (isLandscape) {
-                Modifier
-                    .align(Alignment.CenterEnd)
-                    .navigationBarsPadding()
-                    .padding(end = 14.dp)
-            } else {
-                Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .padding(bottom = 24.dp)
-            },
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            if (!isFront && !isLandscape) {
-                // 显示当前倍率 + 正在用哪颗物理镜头。
-                // 正好落在某颗头上 → "2.0x · 50mm 长焦"；
-                // 两颗头之间（数码裁切）→ 显示实际干活的镜头 + "数码"，如 "3.5x · 23mm 主摄 数码"
-                val lensText = if (zoomStopsFromHardware) {
-                    val optical = opticalLensAt(displayedRatio)
-                    if (optical != null) {
-                        " · ${optical.shortLabel}"
-                    } else {
-                        val active = activeLensAt(displayedRatio)
-                        if (active != null) " · ${active.shortLabel} 数码" else ""
-                    }
-                } else ""
-                Text(
-                    text = formatZoom(displayedRatio) + lensText,
-                    color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold,
-                    modifier = Modifier
-                        .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
-                        .padding(horizontal = 12.dp, vertical = 4.dp)
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-
-                AnimatedVisibility(
-                    visible = showRuler,
-                    enter = expandVertically(
-                        expandFrom = Alignment.Bottom,
-                        animationSpec = tween(durationMillis = 320)
-                    ) + fadeIn(animationSpec = tween(durationMillis = 250)),
-                    exit = shrinkVertically(
-                        shrinkTowards = Alignment.Bottom,
-                        animationSpec = tween(durationMillis = 320)
-                    ) + fadeOut(animationSpec = tween(durationMillis = 200))
-                ) {
-                    ZoomRuler(
-                        currentRatio = displayedRatio,
-                        minRatio = minRatio, maxRatio = maxRatio,
-                        onRatioChange = {
-                            lastRulerInteraction = System.currentTimeMillis()
-                            directSetRatio(it)
-                        },
-                        onDragStateChange = { isDragging = it },
-                        modifier = Modifier.fillMaxWidth().height(105.dp),
-                        stops = zoomStops,
-                        onCommit = {
-                            lastRulerInteraction = System.currentTimeMillis()
-                            commitZoom(it)
-                        }
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(6.dp))
-
-                Row(
-                    modifier = Modifier.pointerInput(Unit) {
-                        detectHorizontalDragGestures(
-                            onDragStart = {
-                                showRuler = true
-                                lastRulerInteraction = System.currentTimeMillis()
-                            }
-                        ) { change, _ ->
-                            change.consume()
-                            lastRulerInteraction = System.currentTimeMillis()
-                        }
-                    },
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    // 档位按钮 = 光学档位 ∪ 常用档位（2x 等没有物理头的档位保留，走数码变焦）
-                    zoomStops.forEach { zoom ->
-                        val isSelected = when {
-                            zoom == 2.0f && abs(selectedZoom - 3.5f) < 0.05f -> true
-                            abs(selectedZoom - zoom) < 0.05f -> true
-                            else -> false
-                        }
-                        // 这台机器到不了的档位（比如 HAL 没上报 0.6x 超广角）直接置灰。
-                        // ★真实存在的光学档位例外★：小米 / iQOO 上 zoomState 常只报 min=1.0，
-                        // 按范围过滤会把 0.6x 超广角按钮弄没 —— 点它时走"物理头直连"兜底。
-                        val isOptical = opticalStops.any { o -> abs(o - zoom) < 0.01f }
-                        val allowed = isOptical ||
-                                (zoom >= minRatio - 0.01f && zoom <= maxRatio + 0.01f &&
-                                        // 高画质模式只允许真实光学档
-                                        (!highResMode || isOpticalStop(zoom)))
-
-                        ZoomButton(
-                            label = formatStop(zoom),
-                            isSelected = isSelected,
-                            enabled = scanDone && allowed,
-                            onClick = {
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                onZoomButtonClick(zoom)
-                            }
-                        )
-                    }
-                }
-                if (!isLandscape) {
-                    Spacer(modifier = Modifier.height(14.dp))
-                }
-            } else if (!isLandscape) {
-                Spacer(modifier = Modifier.height(14.dp))
-            }
-
-            if (mode == CaptureMode.PRO && !isFront && scanDone) {
-                if (!manualControlSupported) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 24.dp, vertical = 8.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(Color.Black.copy(alpha = 0.5f))
-                            .padding(12.dp),
-                        contentAlignment = Alignment.Center
+                if (relayoutLandscape) {
+                    // 横屏：整体放到屏幕【右侧】。从左到右依次是：
+                    //   专业参数（只在专业模式出现）→ 变焦 → 拍摄键 → 模式栏
+                    // 左侧那条是设置栏（像素/比例/闪光/关于），跟录像模式完全一致。
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        // 12dp → 8dp：这一排横向占用再收一点，给取景框让出空间
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Text(
-                            "此设备不支持手动控制（相机 HAL 未开放）",
-                            color = Color(0xFFFFA000),
-                            fontSize = 12.sp,
-                            textAlign = TextAlign.Center
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(10.dp))
-                } else {
-                    ProControls(
-                        proIso = proIso,
-                        onIsoChange = {
-                            proIso = it
-                            applyProParams(it, proShutterNs, proEv, proFocus, proWb)
-                        },
-                        proShutterNs = proShutterNs,
-                        onShutterChange = {
-                            proShutterNs = it
-                            applyProParams(proIso, it, proEv, proFocus, proWb)
-                        },
-                        proEv = proEv,
-                        onEvChange = {
-                            proEv = it
-                            applyProParams(proIso, proShutterNs, it, proFocus, proWb)
-                        },
-                        proFocus = proFocus,
-                        onFocusChange = {
-                            proFocus = it
-                            applyProParams(proIso, proShutterNs, proEv, it, proWb)
-                        },
-                        proWb = proWb,
-                        onWbChange = {
-                            proWb = it
-                            applyProParams(proIso, proShutterNs, proEv, proFocus, it)
-                        },
-                        onReset = {
-                            proIso = 0
-                            proShutterNs = 0L
-                            proEv = 0
-                            proFocus = -1f
-                            proWb = 0
-                            applyProParams(0, 0L, 0, -1f, 0)
+                        // ⓪ 专业模式参数：竖排一列，点开滑条时向左展开
+                        if (mode == CaptureMode.PRO) {
+                            proSection(true)
                         }
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                }
-            }
 
-
-            // 拍摄控制组（相册 / 快门 / 切换）。
-            // 横屏时竖排：参考图向左转 90° 后，底部横排的这三个键变成竖排。
-            val captureControls: @Composable () -> Unit = {
-                Box(
-                    modifier = Modifier
-                        .size(52.dp).clip(RoundedCornerShape(8.dp))
-                        .background(Color.White.copy(alpha = 0.15f))
-                        .clickable { showGallery = true },
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (sessionMedia.isNotEmpty()) {
-                        SessionThumbnail(media = sessionMedia[0], modifier = Modifier.fillMaxSize())
-                    } else {
-                        Text("🖼", fontSize = 20.sp)
-                    }
-                }
-
-                // ★拍摄键常驻底部中央（跟参考图一致）★
-                // 横屏也放在这里：参考图的快门就是底部居中，
-                // 左侧变焦、右侧参数，中间底部留给快门和模式栏。
-                ShutterButton(
-                    isVideoMode = mode == CaptureMode.VIDEO,
-                    isRecording = isRecording,
-                    landscape = isLandscape,
-                    onVideoClick = {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        if (isRecording) stopRecording() else startRecording()
-                    },
-                    onPhotoClick = {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        takePhoto()
-                    }
-                )
-
-                Box(
-                    modifier = Modifier
-                        .size(52.dp).clip(CircleShape)
-                        .background(Color.White.copy(alpha = 0.15f))
-                        .clickable {
-                            if (isFlipping) return@clickable
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            showRuler = false
-                            isFlipping = true
-                            pendingLensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
-                                CameraSelector.LENS_FACING_FRONT
-                            else
-                                CameraSelector.LENS_FACING_BACK
-                            cameraReadyAfterSwitch = false
-
-                            coroutineScope.launch {
-                                val dur = 220L
-                                var t0 = System.currentTimeMillis()
-                                while (true) {
-                                    val el = System.currentTimeMillis() - t0
-                                    val t = (el.toFloat() / dur).coerceIn(0f, 1f)
-                                    flipAngle = 90f * t
-                                    if (t >= 1f) break
-                                    delay(16)
-                                }
-                                // 切换前后摄时物理头直连状态作废，回到"逻辑摄像头 + 数码变焦"
-                                boundLensId = null
-                                pendingZoomTarget = 0f
-                                lensFacing = pendingLensFacing
-                                var wait = 0L
-                                while (!cameraReadyAfterSwitch && wait < 3000) {
-                                    delay(16)
-                                    wait += 16
-                                }
-                                t0 = System.currentTimeMillis()
-                                while (true) {
-                                    val el = System.currentTimeMillis() - t0
-                                    val t = (el.toFloat() / dur).coerceIn(0f, 1f)
-                                    flipAngle = 90f * (1f - t)
-                                    if (t >= 1f) break
-                                    delay(16)
-                                }
-                                flipAngle = 0f
-                                isFlipping = false
-                            }
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text("🔄", fontSize = 22.sp)
-                }
-            }
-
-            if (isLandscape) {
-                // 横屏：快门组靠内、模式栏靠外，都竖排，整体放到屏幕【右侧】
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    // ① 变焦档位：竖排在拍摄键的【左边】
-                    //    横屏时从左到右依次是 变焦 → 拍摄 → 模式栏。
-                    if (!isFront) {
-                        Column(
-                            verticalArrangement = Arrangement.Center,
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            // 当前倍率 + 正在用哪颗镜头
-                            // ★横屏竖着显示★：倍率一行、镜头标签一行。
-                            // 横着排成 "1.0x · 23mm 主摄" 会把这一列撑得很宽，
-                            // 挤掉取景框的空间，所以拆成上下两行。
-                            val opticalLens = opticalLensAt(displayedRatio)
-                            val activeLens = activeLensAt(displayedRatio)
-                            val lensLabel: String = if (zoomStopsFromHardware) {
-                                when {
-                                    opticalLens != null -> opticalLens.shortLabel
-                                    activeLens != null -> "${activeLens.shortLabel} 数码"
-                                    else -> ""
-                                }
-                            } else ""
+                        // ① 变焦档位：竖排在拍摄键的【左边】
+                        //    横屏时从左到右依次是 变焦 → 拍摄 → 模式栏。
+                        if (!isFront) {
                             Column(
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(2.dp)
-                            ) {
-                                Text(
-                                    text = formatZoom(displayedRatio),
-                                    color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold,
-                                    modifier = Modifier
-                                        .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
-                                        .padding(horizontal = 7.dp, vertical = 2.dp)
-                                )
-                                if (lensLabel.isNotEmpty()) {
-                                    Text(
-                                        text = lensLabel,
-                                        color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold,
-                                        maxLines = 1,
-                                        modifier = Modifier
-                                            .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
-                                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                                    )
-                                }
-                            }
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            // ★档位竖排，自下而上：广角 → 长焦★
-                            // Column 是"先声明的排在上面"，所以要【降序】：
-                            // 最上面是长焦(10x)，最下面是 0.6x 广角。
-                            //
-                            // ★强行补一个 10x★：很多机器的 zoomStops 里没有 10x
-                            // （原厂档位只到 5x），但数码变焦上限通常到 10x 甚至更高，
-                            // 横屏竖向空间够放 6 个，就把 10x 补上。
-                            val landscapeStops = remember(zoomStops, opticalStops, maxRatio) {
-                                val optical = zoomStops.filter { z ->
-                                    opticalStops.any { o -> abs(o - z) < 0.01f }
-                                }
-                                val extras = listOf(1.0f, 2.0f).filter { it in zoomStops }
-                                // 10x 只要没超出这台机器的变焦上限就加上
-                                val ten = listOf(10.0f).filter { it <= maxRatio + 0.01f }
-                                (optical + extras + ten)
-                                    .distinct()
-                                    .sortedDescending()
-                                    .take(6)
-                                    .ifEmpty { zoomStops.sortedDescending().take(6) }
-                            }
-                            Column(
-                                verticalArrangement = Arrangement.spacedBy(5.dp),
+                                verticalArrangement = Arrangement.Center,
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
-                                landscapeStops.forEach { zoom ->
-                                    val isSelected = when {
-                                        zoom == 2.0f && abs(selectedZoom - 3.5f) < 0.05f -> true
-                                        abs(selectedZoom - zoom) < 0.05f -> true
-                                        else -> false
-                                    }
-                                    // 光学档位无条件可用（哪怕 HAL 上报的变焦范围不含它，
-                                    // 点它会走"物理头直连"），其它档位仍按变焦范围判断
-                                    val isOptical = opticalStops.any { o -> abs(o - zoom) < 0.01f }
-                                    val allowed = isOptical ||
-                                            (zoom >= minRatio - 0.01f && zoom <= maxRatio + 0.01f &&
-                                                    (!highResMode || isOpticalStop(zoom)))
+                                // ★变焦提示已取消★：原来这里有 "倍率一行 + 镜头标签一行"，
+                                // 跟下面的档位按钮重复，白占竖向空间。现在只保留档位按钮。
 
-                                    ZoomButton(
-                                        label = formatStop(zoom),
-                                        isSelected = isSelected,
-                                        enabled = scanDone && allowed,
-                                        size = 34.dp,
-                                        onClick = {
-                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                            onZoomButtonClick(zoom)
+                                // ★横屏：档位竖排，自下而上 = 广角 → 长焦★
+                                // Column 是"先声明的排在上面"，所以要【降序】：
+                                // 最上面是长焦(10x)，最下面是 0.6x 广角。
+                                //
+                                // ★强行补一个 10x★：很多机器的 zoomStops 里没有 10x
+                                // （原厂档位只到 5x），但数码变焦上限通常到 10x 甚至更高，
+                                // 横屏竖向空间够放 6 个，就把 10x 补上。
+                                val landscapeStops = remember(zoomStops, opticalStops, maxRatio) {
+                                    val optical = zoomStops.filter { z ->
+                                        opticalStops.any { o -> abs(o - z) < 0.01f }
+                                    }
+                                    val extras = listOf(1.0f, 2.0f).filter { it in zoomStops }
+                                    // 10x 只要没超出这台机器的变焦上限就加上
+                                    val ten = listOf(10.0f).filter { it <= maxRatio + 0.01f }
+                                    (optical + extras + ten)
+                                        .distinct()
+                                        .sortedDescending()
+                                        .take(6)
+                                        .ifEmpty { zoomStops.sortedDescending().take(6) }
+                                }
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    landscapeStops.forEach { zoom ->
+                                        val isSelected = when {
+                                            zoom == 2.0f && abs(selectedZoom - 3.5f) < 0.05f -> true
+                                            abs(selectedZoom - zoom) < 0.05f -> true
+                                            else -> false
+                                        }
+                                        // 光学档位无条件可用（哪怕 HAL 上报的变焦范围不含它，
+                                        // 点它会走"物理头直连"），其它档位仍按变焦范围判断
+                                        val isOptical = opticalStops.any { o -> abs(o - zoom) < 0.01f }
+                                        val allowed = isOptical ||
+                                                (zoom >= minRatio - 0.01f && zoom <= maxRatio + 0.01f &&
+                                                        (!highResMode || isOpticalStop(zoom)))
+
+                                        ZoomButton(
+                                            label = formatStop(zoom),
+                                            isSelected = isSelected,
+                                            enabled = scanDone && allowed,
+                                            size = 34.dp,
+                                            onClick = {
+                                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                onZoomButtonClick(zoom)
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            captureControls()
+                        }
+
+                        // ★横屏：这一栏在"模式切换"和"专业参数面板"之间二选一★
+                        // 点开某个参数（EV / S / ISO / WB / F）时，参数面板【竖着替换掉模式栏】，
+                        // 而不是像以前那样往取景框里再塞一块：
+                        //   · 预览空间一点不损失（总宽度没变）
+                        //   · 面板就长在原来模式栏的位置，手指不用挪地方
+                        //   · 再点一次那个参数按钮（或点重置）就切回模式栏
+                        Box(
+                            modifier = Modifier
+                                .width(120.dp)
+                                // ★给竖排滑条留出高度★：轨道 150dp + 标签/数值两行
+                                .height(190.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Crossfade(
+                                targetState = (proActiveParam != null) to mode,
+                                animationSpec = tween(durationMillis = 220)
+                            ) { state ->
+                                val panelOpen = state.first
+                                val curMode = state.second
+                                if (panelOpen && curMode == CaptureMode.PRO && !isFront) {
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(16.dp))
+                                            .background(Color.Black.copy(alpha = 0.82f))
+                                            .border(
+                                                1.dp,
+                                                Color.White.copy(alpha = 0.18f),
+                                                RoundedCornerShape(16.dp)
+                                            )
+                                            .padding(horizontal = 10.dp, vertical = 12.dp)
+                                    ) {
+                                        ProParamPanel(
+                                            activeParam = proActiveParam,
+                                            proIso = proIso,
+                                            onIsoChange = {
+                                                proIso = it
+                                                applyProParams(it, proShutterNs, proEv, proFocus, proWb)
+                                            },
+                                            proShutterNs = proShutterNs,
+                                            onShutterChange = {
+                                                proShutterNs = it
+                                                applyProParams(proIso, it, proEv, proFocus, proWb)
+                                            },
+                                            proEv = proEv,
+                                            onEvChange = {
+                                                proEv = it
+                                                applyProParams(proIso, proShutterNs, it, proFocus, proWb)
+                                            },
+                                            proFocus = proFocus,
+                                            onFocusChange = {
+                                                proFocus = it
+                                                applyProParams(proIso, proShutterNs, proEv, it, proWb)
+                                            },
+                                            proWb = proWb,
+                                            onWbChange = {
+                                                proWb = it
+                                                applyProParams(proIso, proShutterNs, proEv, proFocus, it)
+                                            },
+                                            compact = true,
+                                            // ★滑条竖着画★：这一列窄而高，横着画只有几十 dp 拖不准
+                                            verticalTrack = true
+                                        )
+                                    }
+                                } else {
+                                    ModeSelector(
+                                        current = mode,
+                                        vertical = true,
+                                        onSelect = { next ->
+                                            mode = next
+                                            // 高像素模式下没有录像用例（三流共存会把拍照分辨率压到 1200万），
+                                            // 切进录像时要先退出高像素，否则点录制会没反应
+                                            if (next == CaptureMode.VIDEO && highResMode) {
+                                                highResMode = false
+                                            }
+                                            // ★进录像前回到逻辑摄像头★
+                                            // 录制中换头要 unbindAll，会直接把视频打断，所以录制期间一律不换头；
+                                            // 而单颗物理头的本地变焦范围很窄（广角头只有 0.6~2.4x），
+                                            // 留在上面从大焦段拖回小焦段会拖不动、看起来一卡一卡。
+                                            // 进录像模式时就先退回逻辑头，录制中的变焦就全是纯 setZoomRatio，很顺。
+                                            if (next == CaptureMode.VIDEO && boundLensId != null) {
+                                                pendingZoomTarget = displayedRatio
+                                                lensSwitching = true
+                                                boundLensId = null
+                                            }
                                         }
                                     )
                                 }
                             }
                         }
                     }
-
-                    Column(
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        captureControls()
-                    }
+                } else {
+                    // 竖屏：模式栏在上、快门组在下，保持原来的结构
                     ModeSelector(
                         current = mode,
-                        vertical = true,
                         onSelect = { next ->
                             mode = next
-                            // 高像素模式下没有录像用例（三流共存会把拍照分辨率压到 1200万），
-                            // 切进录像时要先退出高像素，否则点录制会没反应
                             if (next == CaptureMode.VIDEO && highResMode) {
                                 highResMode = false
                             }
+                            // ★进录像前回到逻辑摄像头★（理由同上：录制期间不换头，
+                            // 而物理头本地变焦范围窄，留在上面拖回小焦段会卡）
+                            if (next == CaptureMode.VIDEO && boundLensId != null) {
+                                pendingZoomTarget = displayedRatio
+                                lensSwitching = true
+                                boundLensId = null
+                            }
                         }
                     )
-                }
-            } else {
-                // 竖屏：模式栏在上、快门组在下，保持原来的结构
-                ModeSelector(
-                    current = mode,
-                    onSelect = { next ->
-                        mode = next
-                        if (next == CaptureMode.VIDEO && highResMode) {
-                            highResMode = false
-                        }
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 28.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        captureControls()
                     }
+                }
+
+            }
+
+            AnimatedVisibility(
+                visible = showGallery,
+                enter = slideInVertically(
+                    initialOffsetY = { it },
+                    animationSpec = tween(
+                        durationMillis = 350,
+                        easing = CubicBezierEasing(0.3f, 0.85f, 0.2f, 1f)
+                    )
+                ) + fadeIn(animationSpec = tween(durationMillis = 250)),
+                exit = slideOutVertically(
+                    targetOffsetY = { it },
+                    animationSpec = tween(
+                        durationMillis = 300,
+                        easing = CubicBezierEasing(0.4f, 0f, 0.6f, 1f)
+                    )
+                ) + fadeOut(animationSpec = tween(durationMillis = 250))
+            ) {
+                SessionGallery(media = sessionMedia, onClose = { showGallery = false })
+            }
+
+            AnimatedVisibility(
+                visible = showAbout,
+                enter = slideInHorizontally(
+                    initialOffsetX = { it },
+                    animationSpec = tween(durationMillis = 300, easing = CubicBezierEasing(0.3f, 0.85f, 0.2f, 1f))
+                ) + fadeIn(tween(200)),
+                exit = slideOutHorizontally(
+                    targetOffsetX = { it },
+                    animationSpec = tween(durationMillis = 260, easing = CubicBezierEasing(0.4f, 0f, 0.6f, 1f))
+                ) + fadeOut(tween(180))
+            ) {
+                AboutScreen(
+                    onClose = { showAbout = false },
+                    onShowReward = { showReward = true }
                 )
-                Spacer(modifier = Modifier.height(16.dp))
-                Row(
+            }
+
+            AnimatedVisibility(
+                visible = showReward,
+                enter = fadeIn(tween(durationMillis = 220)),
+                exit = fadeOut(tween(durationMillis = 180))
+            ) {
+                RewardDialog(onClose = { showReward = false })
+            }
+
+            // ★点空白处关闭菜单★
+            // 和闪光灯面板同一套做法：先铺一层全屏半透明层，点它任意位置就收起菜单；
+            // 菜单本体画在它之上，所以点菜单项不会被这层吃掉。
+            AnimatedVisibility(
+                visible = menuPath != null,
+                modifier = Modifier.fillMaxSize(),
+                enter = fadeIn(tween(140)),
+                exit = fadeOut(tween(120))
+            ) {
+                Box(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 28.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    captureControls()
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.25f))
+                        .clickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) { menuPath = null }
+                )
+            }
+
+            // ── 多级菜单 ──
+            //
+            // ★横屏（UI 锁竖屏、界面侧躺）菜单定位★
+            //
+            // 【为什么之前会超出屏幕】
+            // Modifier.rotate 只是绘制变换，**不占布局空间**。菜单 Box 布局尺寸是 w×h
+            // （如 220×260），转 90° 后视觉上占 h×w = 260×220，但 align 仍按 w×h 那个盒子摆角 ——
+            // 转出来的那条长边就溢出窗口边界了。这才是"太靠左 / 超出屏幕"的真正原因，
+            // 跟选哪个角落无关。
+            //
+            // 【修法（纯几何，不靠猜测）】
+            // 把菜单放进一个【正方形安全区】里居中旋转：正方形绕中心转 90° 还是它自己，
+            // 所以旋转后的视觉内容一定完整落在正方形内；再把正方形 align 到某个角，
+            // 就绝不会溢出屏幕。正方形边长取"菜单最大可能长边"，并按屏幕短边夹一下。
+            val menuQuarterTurn: Boolean =
+                abs(shortestLabelRotation % 180f).let { it > 45f && it < 135f }
+            // 屏幕短边：旋转后受约束的永远是较短的那一维
+            val menuShortSide: Float =
+                minOf(configuration.screenWidthDp, configuration.screenHeightDp).toFloat()
+            // 安全区边长：≥ 菜单最大长边，同时不超屏幕短边
+            val menuSafeBox: Dp = MENU_SAFE_BOX_DP
+                .coerceAtMost(menuShortSide - MENU_SIDE_PAD_DP * 2)
+                .coerceAtLeast(MENU_MIN_HEIGHT_DP)
+                .dp
+            // 菜单内容高度：安全区扣掉标题行和上下留白后剩下的空间
+            val menuMaxHeight: Dp = (MENU_SAFE_BOX_DP - 46f)
+                .coerceAtMost(menuShortSide - 46f - MENU_SIDE_PAD_DP * 2)
+                .coerceAtMost(MENU_MAX_HEIGHT_DP)
+                .coerceAtLeast(MENU_MIN_HEIGHT_DP)
+                .dp
+            // 菜单锚点：竖屏恒右上；横屏由"想要的视觉角落"反推出 Compose 锚点
+            val menuAlign: Alignment = if (!menuQuarterTurn) {
+                Alignment.TopEnd
+            } else {
+                composeAnchorForVisual(MENU_VISUAL_CORNER)
+            }
+            /**
+             * ★横屏菜单微调★：把"视觉上的右上"换算成 Compose 坐标系里的偏移。
+             *
+             * 映射 R: (u,v) → (v, -u)，即 视觉位移 (Vx,Vy) = R(dx,dy) = (dy, -dx)。反解得：
+             *   · 视觉向右 (Vx>0)  ⇔  Compose 向下  → verticalBias   = +Vx
+             *   · 视觉向上 (Vy<0)  ⇔  Compose 向右  → horizontalBias = -Vy
+             *
+             * 两个方向的余量【必须分开算】：旋转后宽高互换，
+             *   Compose 水平余量 = (S - 菜单宽)/2  → 决定视觉上下能挪多少
+             *   Compose 垂直余量 = (S - 菜单高)/2  → 决定视觉左右能挪多少
+             * 之前统一用 30dp，结果垂直余量实际只有 0dp，"向右"被夹成不动 —— 就是移不动的原因。
+             *
+             * 用 BiasAlignment 而不是 offset：bias 只在安全区【内部】挪，
+             * 再怎么调都不会把菜单推出安全区、更不会推出屏幕。
+             */
+            val menuSlackH: Float =
+                ((menuSafeBox.value - MENU_PANEL_MAX_W_DP) / 2f).coerceAtLeast(1f)
+            val menuSlackV: Float =
+                ((menuSafeBox.value - MENU_PANEL_MAX_H_DP) / 2f).coerceAtLeast(1f)
+            val menuNudge: Alignment = BiasAlignment(
+                horizontalBias = (MENU_NUDGE_UP_DP / menuSlackH).coerceIn(-1f, 1f),
+                verticalBias = (MENU_NUDGE_RIGHT_DP / menuSlackV).coerceIn(-1f, 1f)
+            )
+
+            AnimatedVisibility(
+                visible = menuPath != null,
+                modifier = Modifier
+                    .then(
+                        // 横屏：套一个正方形安全区，杜绝旋转溢出（竖屏不需要）
+                        if (menuQuarterTurn) Modifier
+                            .align(menuAlign)
+                            .size(menuSafeBox)
+                        else Modifier
+                            .align(Alignment.TopEnd)
+                            .statusBarsPadding()
+                            .padding(
+                                top = MENU_TOP_PAD_PORTRAIT_DP.dp,
+                                end = MENU_SIDE_PAD_DP.dp
+                            )
+                    ),
+                enter = fadeIn(tween(140)) + scaleIn(
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                        stiffness = Spring.StiffnessMedium
+                    ),
+                    initialScale = 0.9f
+                ),
+                exit = fadeOut(tween(120)) + scaleOut(targetScale = 0.92f)
+            ) {
+                if (menuQuarterTurn) {
+                    // 安全区内放置并整体旋转：正方形转 90° 还是正方形，内容不会溢出。
+                    // 用 menuNudge 而不是 Center：让菜单从角落往屏幕内侧挪一点，不贴边。
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = menuNudge
+                    ) {
+                        MultiLevelMenu(
+                            path = menuPath ?: "",
+                            onPathChange = { menuPath = it },
+                            st = settingsBarState,
+                            act = settingsBarActions,
+                            overflow = buildChipSpecs(settingsBarState, settingsBarActions)
+                                .filter { it.id in hiddenChipIds },
+                            // 整体转过来，而不是逐条旋转文字（逐条转会重叠，见 MenuItem 里的说明）
+                            rotation = labelRotationAnim,
+                            maxContentHeight = menuMaxHeight
+                        )
+                    }
+                } else {
+                    MultiLevelMenu(
+                        path = menuPath ?: "",
+                        onPathChange = { menuPath = it },
+                        st = settingsBarState,
+                        act = settingsBarActions,
+                        overflow = buildChipSpecs(settingsBarState, settingsBarActions)
+                            .filter { it.id in hiddenChipIds },
+                        maxContentHeight = menuMaxHeight
+                    )
                 }
             }
 
-        }
-
-        AnimatedVisibility(
-            visible = showGallery,
-            enter = slideInVertically(
-                initialOffsetY = { it },
-                animationSpec = tween(
-                    durationMillis = 350,
-                    easing = CubicBezierEasing(0.3f, 0.85f, 0.2f, 1f)
-                )
-            ) + fadeIn(animationSpec = tween(durationMillis = 250)),
-            exit = slideOutVertically(
-                targetOffsetY = { it },
-                animationSpec = tween(
-                    durationMillis = 300,
-                    easing = CubicBezierEasing(0.4f, 0f, 0.6f, 1f)
-                )
-            ) + fadeOut(animationSpec = tween(durationMillis = 250))
-        ) {
-            SessionGallery(media = sessionMedia, onClose = { showGallery = false })
-        }
-
-        AnimatedVisibility(
-            visible = showAbout,
-            enter = slideInHorizontally(
-                initialOffsetX = { it },
-                animationSpec = tween(durationMillis = 300, easing = CubicBezierEasing(0.3f, 0.85f, 0.2f, 1f))
-            ) + fadeIn(tween(200)),
-            exit = slideOutHorizontally(
-                targetOffsetX = { it },
-                animationSpec = tween(durationMillis = 260, easing = CubicBezierEasing(0.4f, 0f, 0.6f, 1f))
-            ) + fadeOut(tween(180))
-        ) {
-            AboutScreen(
-                onClose = { showAbout = false },
-                onShowReward = { showReward = true }
+            // ── 侧边返回：从左边缘往右滑 = 返回 ──
+            EdgeSwipeBack(
+                modifier = Modifier.align(Alignment.CenterStart),
+                onBack = { goBack() }
             )
         }
-
-        AnimatedVisibility(
-            visible = showReward,
-            enter = fadeIn(tween(durationMillis = 220)),
-            exit = fadeOut(tween(durationMillis = 180))
-        ) {
-            RewardDialog(onClose = { showReward = false })
-        }
-    }
+    } // ★CompositionLocalProvider 闭合★
 }
 
 // ==================== 专业模式 UI ====================
 
+/**
+ * ★专业参数滑条面板★：从 ProControls 里抽出来的公共部分。
+ *
+ * 两个地方共用它，避免同一套滑条写两份：
+ *   · 竖屏：展开在参数按钮行上方（老行为，保持不变）
+ *   · 横屏：由 CameraApp 画成"覆盖模式切换栏"的浮层
+ *
+ * @param compact 紧凑布局：标签 / 数值 / 自动键挪到上一行，滑条独占整行
+ */
 @Composable
-fun ProControls(
+fun ProParamPanel(
+    activeParam: ProParam?,
     proIso: Int, onIsoChange: (Int) -> Unit,
     proShutterNs: Long, onShutterChange: (Long) -> Unit,
     proEv: Int, onEvChange: (Int) -> Unit,
     proFocus: Float, onFocusChange: (Float) -> Unit,
     proWb: Int, onWbChange: (Int) -> Unit,
-    onReset: () -> Unit
+    compact: Boolean = false,
+    /** ★竖排滑条★：横屏专业模式（面板竖着替换模式栏）时传 true */
+    verticalTrack: Boolean = false
+) {
+    Column {
+        when (activeParam) {
+            ProParam.EV -> {
+                ProSlider(
+                    label = "EV",
+                    displayValue = when {
+                        proEv > 0 -> "+$proEv"
+                        proEv < 0 -> "$proEv"
+                        else -> "0"
+                    },
+                    value = proEv.toFloat(),
+                    range = -2f..2f,
+                    isAuto = proEv == 0,
+                    onValueChange = { onEvChange(it.toInt()) },
+                    onResetAuto = { onEvChange(0) },
+                    compact = compact,
+                    verticalTrack = verticalTrack
+                )
+            }
+            ProParam.SHUTTER -> {
+                val speedMin = 30f
+                val speedMax = 1000f
+                val currentSpeed = if (proShutterNs == 0L) {
+                    speedMin
+                } else {
+                    (1_000_000_000.0 / proShutterNs)
+                        .toFloat()
+                        .coerceIn(speedMin, speedMax)
+                }
+                val disp = if (proShutterNs == 0L) "自动"
+                else "1/${currentSpeed.toInt().coerceAtLeast(1)}"
+                ProSlider(
+                    label = "S",
+                    displayValue = disp,
+                    value = currentSpeed,
+                    range = speedMin..speedMax,
+                    isAuto = proShutterNs == 0L,
+                    onValueChange = {
+                        val speed = it.coerceIn(speedMin, speedMax)
+                        val ns = (1_000_000_000.0 / speed).toLong()
+                        onShutterChange(ns)
+                    },
+                    onResetAuto = { onShutterChange(0L) },
+                    compact = compact,
+                    verticalTrack = verticalTrack
+                )
+            }
+            ProParam.ISO -> {
+                val v = if (proIso == 0) 100f else proIso.toFloat()
+                val disp = if (proIso == 0) "自动" else "$proIso"
+                ProSlider(
+                    label = "ISO",
+                    displayValue = disp,
+                    value = v,
+                    range = 100f..3200f,
+                    isAuto = proIso == 0,
+                    onValueChange = { onIsoChange(it.toInt()) },
+                    onResetAuto = { onIsoChange(0) },
+                    compact = compact,
+                    verticalTrack = verticalTrack
+                )
+            }
+            ProParam.WB -> {
+                ProSlider(
+                    label = "WB",
+                    displayValue = wbLabel(proWb),
+                    value = proWb.toFloat(),
+                    range = 0f..4f,
+                    isAuto = proWb == 0,
+                    onValueChange = { onWbChange(it.toInt()) },
+                    onResetAuto = { onWbChange(0) },
+                    compact = compact,
+                    verticalTrack = verticalTrack
+                )
+            }
+            ProParam.FOCUS -> {
+                ProSlider(
+                    label = "F",
+                    displayValue = if (proFocus < 0f) "自动" else "%.1f".format(proFocus),
+                    value = if (proFocus < 0f) 0f else proFocus,
+                    range = 0f..10f,
+                    isAuto = proFocus < 0f,
+                    onValueChange = { onFocusChange(it) },
+                    onResetAuto = { onFocusChange(-1f) },
+                    compact = compact,
+                    verticalTrack = verticalTrack
+                )
+            }
+            null -> { }
+        }
+    }
+}
+
+@Composable
+fun ProControls(
+    vertical: Boolean = false,
+    proIso: Int, onIsoChange: (Int) -> Unit,
+    proShutterNs: Long, onShutterChange: (Long) -> Unit,
+    proEv: Int, onEvChange: (Int) -> Unit,
+    proFocus: Float, onFocusChange: (Float) -> Unit,
+    proWb: Int, onWbChange: (Int) -> Unit,
+    onReset: () -> Unit,
+    /**
+     * ★当前展开的参数★
+     * 横屏时滑条面板要做成"覆盖模式切换栏"的浮层（由 CameraApp 绘制），
+     * 所以这个状态提升到外面持有，ProControls 只负责按钮列本身。
+     */
+    activeParam: ProParam? = null,
+    onActiveParamChange: (ProParam?) -> Unit = {}
 ) {
     val haptic = LocalHapticFeedback.current
-    var activeParam by remember { mutableStateOf<ProParam?>(null) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        AnimatedVisibility(
-            visible = activeParam != null,
-            enter = expandVertically(
-                expandFrom = Alignment.Bottom,
-                animationSpec = tween(220)
-            ) + fadeIn(tween(180)),
-            exit = shrinkVertically(
-                shrinkTowards = Alignment.Bottom,
-                animationSpec = tween(180)
-            ) + fadeOut(tween(140))
+    /**
+     * 滑条面板内容。竖屏展开在按钮行上方，横屏由外层浮层使用。
+     */
+    val panelContent: @Composable () -> Unit = {
+        ProParamPanel(
+            activeParam = activeParam,
+            proIso = proIso, onIsoChange = onIsoChange,
+            proShutterNs = proShutterNs, onShutterChange = onShutterChange,
+            proEv = proEv, onEvChange = onEvChange,
+            proFocus = proFocus, onFocusChange = onFocusChange,
+            proWb = proWb, onWbChange = onWbChange,
+            compact = vertical,
+            verticalTrack = false
+        )
+    }
+
+
+    /**
+     * 参数按钮组（重置 / EV / S / ISO / WB / F）。
+     * 同样抽成 lambda：横屏竖排、竖屏横排共用这一份。
+     */
+    // 横屏竖排：6 个 56dp 的圈叠起来要 336dp+，在 400dp 出头的横屏高度里会顶出去，
+    // 所以竖排时统一缩到 46dp。
+    val btnSize: Dp = if (vertical) 46.dp else 56.dp
+    val proButtons: @Composable () -> Unit = {
+        ProCircleButton(
+            value = "↻",
+            label = "",
+            isActive = false,
+            isReset = true,
+            onClick = {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                onActiveParamChange(null)
+                onReset()
+            },
+            size = btnSize
+        )
+
+        ProCircleButton(
+            value = when {
+                proEv > 0 -> "+$proEv"
+                proEv < 0 -> "$proEv"
+                else -> "0"
+            },
+            label = "EV",
+            isActive = activeParam == ProParam.EV,
+            onClick = {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                onActiveParamChange(
+                    if (activeParam == ProParam.EV) null else ProParam.EV
+                )
+            },
+            size = btnSize
+        )
+
+        ProCircleButton(
+            value = if (proShutterNs == 0L) "AUTO" else {
+                val s = 1_000_000_000.0 / proShutterNs
+                "1/${s.toInt().coerceAtLeast(1)}"
+            },
+            label = "S",
+            isActive = activeParam == ProParam.SHUTTER,
+            onClick = {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                onActiveParamChange(
+                    if (activeParam == ProParam.SHUTTER) null else ProParam.SHUTTER
+                )
+            },
+            size = btnSize
+        )
+
+        ProCircleButton(
+            value = if (proIso == 0) "AUTO" else "$proIso",
+            label = "ISO",
+            isActive = activeParam == ProParam.ISO,
+            onClick = {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                onActiveParamChange(
+                    if (activeParam == ProParam.ISO) null else ProParam.ISO
+                )
+            },
+            size = btnSize
+        )
+
+        ProCircleButton(
+            value = wbShortLabel(proWb),
+            label = "WB",
+            isActive = activeParam == ProParam.WB,
+            onClick = {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                onActiveParamChange(
+                    if (activeParam == ProParam.WB) null else ProParam.WB
+                )
+            },
+            size = btnSize
+        )
+
+        ProCircleButton(
+            value = if (proFocus < 0f) "AF" else "%.1f".format(proFocus),
+            label = "F",
+            isActive = activeParam == ProParam.FOCUS,
+            onClick = {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                onActiveParamChange(
+                    if (activeParam == ProParam.FOCUS) null else ProParam.FOCUS
+                )
+            },
+            size = btnSize
+        )
+    }
+
+    if (vertical) {
+        // ★横屏：这里只放按钮列，不再向左展开面板★
+        // 面板改由 CameraApp 画成"覆盖模式切换栏"的浮层，
+        // 于是展开参数时一点预览空间都不占，模式栏只是被临时盖住。
+        Column(
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 10.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(Color.Black.copy(alpha = 0.55f))
-                    .border(1.dp, Color.White.copy(alpha = 0.15f), RoundedCornerShape(14.dp))
-                    .padding(horizontal = 16.dp, vertical = 10.dp)
+            proButtons()
+        }
+    } else {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            AnimatedVisibility(
+                visible = activeParam != null,
+                enter = expandVertically(
+                    expandFrom = Alignment.Bottom,
+                    animationSpec = tween(220)
+                ) + fadeIn(tween(180)),
+                exit = shrinkVertically(
+                    shrinkTowards = Alignment.Bottom,
+                    animationSpec = tween(180)
+                ) + fadeOut(tween(140))
             ) {
-                when (activeParam) {
-                    ProParam.EV -> {
-                        ProSlider(
-                            label = "EV",
-                            displayValue = when {
-                                proEv > 0 -> "+$proEv"
-                                proEv < 0 -> "$proEv"
-                                else -> "0"
-                            },
-                            value = proEv.toFloat(),
-                            range = -2f..2f,
-                            isAuto = proEv == 0,
-                            onValueChange = { onEvChange(it.toInt()) },
-                            onResetAuto = { onEvChange(0) }
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 10.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color.Black.copy(alpha = 0.55f))
+                        .border(
+                            1.dp, Color.White.copy(alpha = 0.15f), RoundedCornerShape(14.dp)
                         )
-                    }
-                    ProParam.SHUTTER -> {
-                        val speedMin = 30f
-                        val speedMax = 1000f
-                        val currentSpeed = if (proShutterNs == 0L) {
-                            speedMin
-                        } else {
-                            (1_000_000_000.0 / proShutterNs)
-                                .toFloat()
-                                .coerceIn(speedMin, speedMax)
-                        }
-                        val disp = if (proShutterNs == 0L) "自动"
-                        else "1/${currentSpeed.toInt().coerceAtLeast(1)}"
-                        ProSlider(
-                            label = "S",
-                            displayValue = disp,
-                            value = currentSpeed,
-                            range = speedMin..speedMax,
-                            isAuto = proShutterNs == 0L,
-                            onValueChange = {
-                                val speed = it.coerceIn(speedMin, speedMax)
-                                val ns = (1_000_000_000.0 / speed).toLong()
-                                onShutterChange(ns)
-                            },
-                            onResetAuto = { onShutterChange(0L) }
-                        )
-                    }
-                    ProParam.ISO -> {
-                        val v = if (proIso == 0) 100f else proIso.toFloat()
-                        val disp = if (proIso == 0) "自动" else "$proIso"
-                        ProSlider(
-                            label = "ISO",
-                            displayValue = disp,
-                            value = v,
-                            range = 100f..3200f,
-                            isAuto = proIso == 0,
-                            onValueChange = { onIsoChange(it.toInt()) },
-                            onResetAuto = { onIsoChange(0) }
-                        )
-                    }
-                    ProParam.WB -> {
-                        ProSlider(
-                            label = "WB",
-                            displayValue = wbLabel(proWb),
-                            value = proWb.toFloat(),
-                            range = 0f..4f,
-                            isAuto = proWb == 0,
-                            onValueChange = { onWbChange(it.toInt()) },
-                            onResetAuto = { onWbChange(0) }
-                        )
-                    }
-                    ProParam.FOCUS -> {
-                        ProSlider(
-                            label = "F",
-                            displayValue = if (proFocus < 0f) "自动" else "%.1f".format(proFocus),
-                            value = if (proFocus < 0f) 0f else proFocus,
-                            range = 0f..10f,
-                            isAuto = proFocus < 0f,
-                            onValueChange = { onFocusChange(it) },
-                            onResetAuto = { onFocusChange(-1f) }
-                        )
-                    }
-                    null -> { }
+                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                ) {
+                    panelContent()
                 }
             }
-        }
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            ProCircleButton(
-                value = "↻",
-                label = "",
-                isActive = false,
-                isReset = true,
-                onClick = {
-                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    activeParam = null
-                    onReset()
-                }
-            )
-
-            ProCircleButton(
-                value = when {
-                    proEv > 0 -> "+$proEv"
-                    proEv < 0 -> "$proEv"
-                    else -> "0"
-                },
-                label = "EV",
-                isActive = activeParam == ProParam.EV,
-                onClick = {
-                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    activeParam = if (activeParam == ProParam.EV) null else ProParam.EV
-                }
-            )
-
-            ProCircleButton(
-                value = if (proShutterNs == 0L) "AUTO" else {
-                    val s = 1_000_000_000.0 / proShutterNs
-                    "1/${s.toInt().coerceAtLeast(1)}"
-                },
-                label = "S",
-                isActive = activeParam == ProParam.SHUTTER,
-                onClick = {
-                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    activeParam = if (activeParam == ProParam.SHUTTER) null else ProParam.SHUTTER
-                }
-            )
-
-            ProCircleButton(
-                value = if (proIso == 0) "AUTO" else "$proIso",
-                label = "ISO",
-                isActive = activeParam == ProParam.ISO,
-                onClick = {
-                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    activeParam = if (activeParam == ProParam.ISO) null else ProParam.ISO
-                }
-            )
-
-            ProCircleButton(
-                value = wbShortLabel(proWb),
-                label = "WB",
-                isActive = activeParam == ProParam.WB,
-                onClick = {
-                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    activeParam = if (activeParam == ProParam.WB) null else ProParam.WB
-                }
-            )
-
-            ProCircleButton(
-                value = if (proFocus < 0f) "AF" else "%.1f".format(proFocus),
-                label = "F",
-                isActive = activeParam == ProParam.FOCUS,
-                onClick = {
-                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    activeParam = if (activeParam == ProParam.FOCUS) null else ProParam.FOCUS
-                }
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                proButtons()
+            }
         }
     }
 }
@@ -4588,7 +6934,9 @@ fun ProCircleButton(
     label: String,
     isActive: Boolean,
     onClick: () -> Unit,
-    isReset: Boolean = false
+    isReset: Boolean = false,
+    // 横屏竖排时 6 个 56dp 的圈会顶满甚至溢出屏幕高度，缩到 46dp
+    size: Dp = 56.dp
 ) {
     val bgColor = when {
         isActive -> Color(0xFFFFC107)
@@ -4602,13 +6950,25 @@ fun ProCircleButton(
         else -> Color.White.copy(alpha = 0.2f)
     }
 
+    // ★交互动画★：按下缩到 0.88、选中时略微放大到 1.06，抬手回弹
+    val src = remember { MutableInteractionSource() }
+    val bgAnimated = rememberPressColor(
+        interactionSource = src,
+        normal = bgColor,
+        pressedColor = if (isActive) Color(0xFFFFD54F) else Color.White.copy(alpha = 0.28f)
+    )
+
     Box(
         modifier = Modifier
-            .size(56.dp)
+            .bouncyPress(src, pressed = 0.88f, selected = isActive, selectedScale = 1.06f)
+            .size(size)
             .clip(CircleShape)
-            .background(bgColor)
+            .background(bgAnimated)
             .border(1.dp, borderColor, CircleShape)
-            .clickable { onClick() },
+            .clickable(
+                interactionSource = src,
+                indication = null
+            ) { onClick() },
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -4620,7 +6980,9 @@ fun ProCircleButton(
                 color = textColor,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,
-                maxLines = 1
+                maxLines = 1,
+                // ★只旋转文字★
+                modifier = Modifier.rotate(LocalLabelRotation.current)
             )
             if (label.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(1.dp))
@@ -4629,7 +6991,9 @@ fun ProCircleButton(
                     color = if (isActive) Color.Black.copy(alpha = 0.7f)
                     else Color.White.copy(alpha = 0.6f),
                     fontSize = 9.sp,
-                    maxLines = 1
+                    maxLines = 1,
+                    // ★只旋转文字★
+                    modifier = Modifier.rotate(LocalLabelRotation.current)
                 )
             }
         }
@@ -4645,36 +7009,49 @@ fun ProSlider(
     range: ClosedFloatingPointRange<Float>,
     isAuto: Boolean,
     onValueChange: (Float) -> Unit,
-    onResetAuto: () -> Unit
+    onResetAuto: () -> Unit,
+    /**
+     * ★紧凑布局★
+     * 横屏时专业面板只有 210.dp 宽，"标签 + 滑条 + 数值 + 自动键"挤在一行，
+     * 滑条只剩几 dp，手指根本拖不动 —— 这就是"横屏专业模式调不了参数"的根因。
+     * 紧凑模式下把标签 / 数值 / 自动键挪到上一行，滑条独占一整行。
+     */
+    compact: Boolean = false,
+    /**
+     * ★竖排滑条★：轨道竖着画（上大下小 / 上慢下快看具体参数），手指上下拖。
+     * 横屏专业模式里，参数面板是竖着替换掉模式栏的那一列 —— 那一列窄而高，
+     * 横着画滑条只有几十 dp 根本拖不准，竖着画才有足够行程。
+     */
+    verticalTrack: Boolean = false
 ) {
     val haptic = LocalHapticFeedback.current
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 2.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            label,
-            color = Color.White.copy(alpha = 0.75f),
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.width(34.dp)
-        )
+
+    /**
+     * 滑条轨道。
+     * @param vertical true = 竖着画（上 = range.endInclusive，下 = range.start），手指上下拖
+     */
+    val track: @Composable (Modifier, Boolean) -> Unit = { mod, vertical ->
         Box(
-            modifier = Modifier
-                .weight(1f)
-                .height(32.dp)
+            modifier = mod
                 .pointerInput(range) {
                     detectDragGestures(
                         onDragStart = { offset ->
-                            val frac = (offset.x / size.width).coerceIn(0f, 1f)
+                            val frac: Float = if (vertical) {
+                                // 竖排：顶部是最大值，所以要反过来
+                                1f - (offset.y / size.height).coerceIn(0f, 1f)
+                            } else {
+                                (offset.x / size.width).coerceIn(0f, 1f)
+                            }
                             val v = range.start + frac * (range.endInclusive - range.start)
                             onValueChange(v)
                         }
                     ) { change, _ ->
                         change.consume()
-                        val frac = (change.position.x / size.width).coerceIn(0f, 1f)
+                        val frac: Float = if (vertical) {
+                            1f - (change.position.y / size.height).coerceIn(0f, 1f)
+                        } else {
+                            (change.position.x / size.width).coerceIn(0f, 1f)
+                        }
                         val v = range.start + frac * (range.endInclusive - range.start)
                         onValueChange(v)
                     }
@@ -4684,59 +7061,97 @@ fun ProSlider(
             Canvas(modifier = Modifier.fillMaxSize()) {
                 val h = size.height
                 val w = size.width
-                val y = h / 2f
-                drawLine(
-                    color = Color.White.copy(alpha = 0.18f),
-                    start = Offset(0f, y),
-                    end = Offset(w, y),
-                    strokeWidth = 3.dp.toPx(),
-                    cap = StrokeCap.Round
-                )
-                for (i in 0..10) {
-                    val x = w * i / 10f
-                    drawLine(
-                        color = Color.White.copy(alpha = 0.3f),
-                        start = Offset(x, y - 4.dp.toPx()),
-                        end = Offset(x, y + 4.dp.toPx()),
-                        strokeWidth = 1.dp.toPx()
-                    )
-                }
                 val frac = if (range.endInclusive > range.start) {
                     ((value - range.start) /
                             (range.endInclusive - range.start)).coerceIn(0f, 1f)
                 } else 0f
                 // 自动状态时用灰色轨道提示
-                drawLine(
-                    color = if (isAuto) Color.White.copy(alpha = 0.3f)
-                    else Color(0xFFFFC107),
-                    start = Offset(0f, y),
-                    end = Offset(w * frac, y),
-                    strokeWidth = 3.dp.toPx(),
-                    cap = StrokeCap.Round
-                )
-                drawCircle(
-                    color = if (isAuto) Color.White.copy(alpha = 0.5f)
-                    else Color(0xFFFFC107),
-                    radius = 8.dp.toPx(),
-                    center = Offset(w * frac, y)
-                )
-                drawCircle(
-                    color = Color.White,
-                    radius = 4.dp.toPx(),
-                    center = Offset(w * frac, y)
-                )
+                val activeColor = if (isAuto) Color.White.copy(alpha = 0.3f)
+                else Color(0xFFFFC107)
+                val thumbOuter = if (isAuto) Color.White.copy(alpha = 0.5f)
+                else Color(0xFFFFC107)
+
+                if (vertical) {
+                    val x = w / 2f
+                    // 底轨
+                    drawLine(
+                        color = Color.White.copy(alpha = 0.18f),
+                        start = Offset(x, 0f),
+                        end = Offset(x, h),
+                        strokeWidth = 3.dp.toPx(),
+                        cap = StrokeCap.Round
+                    )
+                    // 刻度
+                    for (i in 0..10) {
+                        val yy = h * i / 10f
+                        drawLine(
+                            color = Color.White.copy(alpha = 0.3f),
+                            start = Offset(x - 4.dp.toPx(), yy),
+                            end = Offset(x + 4.dp.toPx(), yy),
+                            strokeWidth = 1.dp.toPx()
+                        )
+                    }
+                    // 已选段：从底部往上画到 thumb
+                    val cy = h * (1f - frac)
+                    drawLine(
+                        color = activeColor,
+                        start = Offset(x, h),
+                        end = Offset(x, cy),
+                        strokeWidth = 3.dp.toPx(),
+                        cap = StrokeCap.Round
+                    )
+                    drawCircle(
+                        color = thumbOuter,
+                        radius = 8.dp.toPx(),
+                        center = Offset(x, cy)
+                    )
+                    drawCircle(
+                        color = Color.White,
+                        radius = 4.dp.toPx(),
+                        center = Offset(x, cy)
+                    )
+                } else {
+                    val y = h / 2f
+                    drawLine(
+                        color = Color.White.copy(alpha = 0.18f),
+                        start = Offset(0f, y),
+                        end = Offset(w, y),
+                        strokeWidth = 3.dp.toPx(),
+                        cap = StrokeCap.Round
+                    )
+                    for (i in 0..10) {
+                        val x = w * i / 10f
+                        drawLine(
+                            color = Color.White.copy(alpha = 0.3f),
+                            start = Offset(x, y - 4.dp.toPx()),
+                            end = Offset(x, y + 4.dp.toPx()),
+                            strokeWidth = 1.dp.toPx()
+                        )
+                    }
+                    drawLine(
+                        color = activeColor,
+                        start = Offset(0f, y),
+                        end = Offset(w * frac, y),
+                        strokeWidth = 3.dp.toPx(),
+                        cap = StrokeCap.Round
+                    )
+                    drawCircle(
+                        color = thumbOuter,
+                        radius = 8.dp.toPx(),
+                        center = Offset(w * frac, y)
+                    )
+                    drawCircle(
+                        color = Color.White,
+                        radius = 4.dp.toPx(),
+                        center = Offset(w * frac, y)
+                    )
+                }
             }
         }
-        Text(
-            displayValue,
-            color = if (isAuto) Color.White.copy(alpha = 0.6f) else Color.White,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Medium,
-            modifier = Modifier.width(52.dp),
-            textAlign = TextAlign.End
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-        // 🎯 自动按钮
+    }
+
+    // 自动按钮（🎯 自动）
+    val autoBtn: @Composable () -> Unit = {
         Box(
             modifier = Modifier
                 .size(30.dp)
@@ -4759,8 +7174,122 @@ fun ProSlider(
                 text = "A",
                 color = if (isAuto) Color.Black else Color.White,
                 fontSize = 13.sp,
-                fontWeight = FontWeight.Bold
+                fontWeight = FontWeight.Bold,
+                // ★只旋转文字★
+                modifier = Modifier.rotate(LocalLabelRotation.current)
             )
+        }
+    }
+
+    if (verticalTrack) {
+        // ★竖排★：标签 + 自动键一行 → 数值 → 竖着的轨道（给足上下拖动行程）
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 2.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    label,
+                    color = Color.White.copy(alpha = 0.75f),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    // ★只旋转文字★
+                    modifier = Modifier.rotate(LocalLabelRotation.current)
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                autoBtn()
+            }
+            Text(
+                displayValue,
+                color = if (isAuto) Color.White.copy(alpha = 0.6f) else Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                // ★只旋转文字★
+                modifier = Modifier.rotate(LocalLabelRotation.current)
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            track(
+                Modifier
+                    .fillMaxWidth()
+                    .height(PRO_SLIDER_VERTICAL_TRACK_H),
+                true
+            )
+        }
+    } else if (compact) {
+        Column(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    label,
+                    color = Color.White.copy(alpha = 0.75f),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    // ★只旋转文字★
+                    modifier = Modifier.rotate(LocalLabelRotation.current)
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                Text(
+                    displayValue,
+                    color = if (isAuto) Color.White.copy(alpha = 0.6f) else Color.White,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    textAlign = TextAlign.End,
+                    // ★只旋转文字★
+                    modifier = Modifier.rotate(LocalLabelRotation.current)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                autoBtn()
+            }
+            track(
+                Modifier
+                    .fillMaxWidth()
+                    .height(32.dp),
+                false
+            )
+        }
+    } else {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                label,
+                color = Color.White.copy(alpha = 0.75f),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                // ★只旋转文字★
+                modifier = Modifier
+                    .width(34.dp)
+                    .rotate(LocalLabelRotation.current)
+            )
+            track(
+                Modifier
+                    .weight(1f)
+                    .height(32.dp),
+                false
+            )
+            Text(
+                displayValue,
+                color = if (isAuto) Color.White.copy(alpha = 0.6f) else Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier
+                    .width(52.dp)
+                    // ★只旋转文字★
+                    .rotate(LocalLabelRotation.current),
+                textAlign = TextAlign.End
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            autoBtn()
         }
     }
 }
@@ -4773,6 +7302,8 @@ fun AboutScreen(
     onShowReward: () -> Unit
 ) {
     val haptic = LocalHapticFeedback.current
+    // 排查"最新版还弹更新"时看这一行：它必须 >= update.json 里的 versionCode
+    val context = LocalContext.current
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -4811,7 +7342,7 @@ fun AboutScreen(
                     .padding(horizontal = 32.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text("Silky Camera", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                Text(APP_DISPLAY_NAME, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(8.dp))
                 Text("版本 $APP_VERSION_NAME", color = Color.White.copy(alpha = 0.5f), fontSize = 14.sp)
 
@@ -4826,6 +7357,13 @@ fun AboutScreen(
                         .padding(20.dp)
                 ) {
                     AboutRow(label = "版本", value = APP_VERSION_NAME)
+                    Spacer(modifier = Modifier.height(14.dp))
+                    // 更新判断用的是这个整数（来自 build.gradle），不是上面那个字符串。
+                    // 它小于 update.json 的 versionCode 就会一直弹更新 —— 发版务必同步递增
+                    AboutRow(
+                        label = "版本码",
+                        value = AppUpdate.currentVersionCode(context).toString()
+                    )
                     Spacer(modifier = Modifier.height(14.dp))
                     AboutRow(label = "制作", value = "Kotlin + Jetpack Compose + CameraX")
                     Spacer(modifier = Modifier.height(14.dp))
@@ -5061,7 +7599,9 @@ private fun ModeItem(
     m: CaptureMode,
     selected: Boolean,
     vertical: Boolean,
-    onSelect: (CaptureMode) -> Unit
+    onSelect: (CaptureMode) -> Unit,
+    /** 文字旋转角。竖排模式下外层已整列旋转，这里要传 0f，否则会转两次 */
+    textRotation: Float = LocalLabelRotation.current
 ) {
     val haptic = LocalHapticFeedback.current
 
@@ -5080,9 +7620,15 @@ private fun ModeItem(
         label = "modeUnderline"
     )
 
+    // ★交互动画★：按下缩小，配合已有的下划线宽度 / 文字颜色过渡
+    val src = remember { MutableInteractionSource() }
     Box(
         modifier = Modifier
-            .clickable {
+            .bouncyPress(src, pressed = 0.90f)
+            .clickable(
+                interactionSource = src,
+                indication = null
+            ) {
                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                 onSelect(m)
             }
@@ -5101,7 +7647,9 @@ private fun ModeItem(
                 text = m.label,
                 color = textColor,
                 fontSize = if (vertical) 13.sp else 14.sp,
-                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+                // ★只旋转文字★（竖排时外层整列已转，这里收到 0f 不再转）
+                modifier = Modifier.rotate(textRotation)
             )
             Spacer(modifier = Modifier.height(4.dp))
             Box(
@@ -5128,12 +7676,19 @@ fun ModeSelector(
     vertical: Boolean = false
 ) {
     if (vertical) {
+        // ★竖排时整列旋转★：跟菜单同一个道理 —— 竖排的一列里逐条转文字会互相重叠。
         Column(
+            modifier = Modifier.rotate(LocalLabelRotation.current),
             verticalArrangement = Arrangement.spacedBy(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             CaptureMode.values().forEach { m ->
-                ModeItem(m = m, selected = m == current, vertical = true, onSelect = onSelect)
+                ModeItem(
+                    m = m, selected = m == current, vertical = true,
+                    onSelect = onSelect,
+                    // 整列已经转过了，这里不能再转一次
+                    textRotation = 0f
+                )
             }
         }
     } else {
@@ -5150,8 +7705,26 @@ fun ModeSelector(
 
 // ==================== 相册 ====================
 
+/**
+ * 用系统相册打开本次拍的某张照片 / 某段视频。
+ * 带上 FLAG_GRANT_READ_URI_PERMISSION，第三方相册才有权限读这个 Uri。
+ */
+fun openInSystemGallery(context: Context, media: CapturedMedia) {
+    try {
+        val mime = if (media.isVideo) "video/*" else "image/*"
+        val intent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(media.uri, mime)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(Intent.createChooser(intent, "用系统相册打开"))
+    } catch (e: Exception) {
+        Log.w("Camera", "跳转系统相册失败", e)
+    }
+}
+
 @Composable
 fun SessionGallery(media: List<CapturedMedia>, onClose: () -> Unit) {
+    val context = LocalContext.current
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
         Column(modifier = Modifier.fillMaxSize()) {
             Row(
@@ -5191,6 +7764,8 @@ fun SessionGallery(media: List<CapturedMedia>, onClose: () -> Unit) {
                                 .aspectRatio(1f)
                                 .clip(RoundedCornerShape(6.dp))
                                 .background(Color.DarkGray)
+                                // ★点一下就跳到系统相册里对应的那张照片 / 那段视频★
+                                .clickable { openInSystemGallery(context, item) }
                         ) {
                             SessionThumbnail(media = item, modifier = Modifier.fillMaxSize())
                             if (item.isVideo) {
@@ -5239,8 +7814,6 @@ fun SessionThumbnail(media: CapturedMedia, modifier: Modifier = Modifier) {
 
 // ==================== 变焦 ====================
 
-fun formatZoom(ratio: Float): String = "%.1fx".format(ratio)
-
 @Composable
 fun ZoomRuler(
     currentRatio: Float,
@@ -5252,7 +7825,9 @@ fun ZoomRuler(
     // 光学档位刻度：来自原厂镜头参数的真实倍率，空则退回默认刻度
     stops: List<Float> = listOf(0.6f, 1.0f, 2.0f, 5.0f, 10.0f),
     // 松手回调：用于吸附到最近的光学镜头
-    onCommit: ((Float) -> Unit)? = null
+    onCommit: ((Float) -> Unit)? = null,
+    // ★轮盘贴图★：盘面底纹 + 内圈，关掉就是最朴素的单线刻度
+    showDialTexture: Boolean = true
 ) {
     val logMin = remember(minRatio) { ln(minRatio) }
     val logMax = remember(maxRatio) { ln(maxRatio) }
@@ -5308,6 +7883,37 @@ fun ZoomRuler(
             cX + radius * sin(a),
             cY - radius * cos(a)
         )
+
+        // ★轮盘贴图★：盘面底纹（径向渐变）+ 内圈细线，做出原厂相机刻度盘的质感
+        if (showDialTexture) {
+            val dialW = 26.dp.toPx()
+            drawArc(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        Color.White.copy(alpha = 0.10f),
+                        Color.White.copy(alpha = 0.05f),
+                        Color.Transparent
+                    ),
+                    center = Offset(cX, cY),
+                    radius = R
+                ),
+                startAngle = 270f - thetaDeg,
+                sweepAngle = thetaDeg * 2f,
+                useCenter = false,
+                topLeft = Offset(cX - R, cY - R),
+                size = GeoSize(R * 2f, R * 2f),
+                style = Stroke(width = dialW, cap = StrokeCap.Round)
+            )
+            drawArc(
+                color = Color.White.copy(alpha = 0.10f),
+                startAngle = 270f - thetaDeg,
+                sweepAngle = thetaDeg * 2f,
+                useCenter = false,
+                topLeft = Offset(cX - R + dialW, cY - R + dialW),
+                size = GeoSize((R - dialW) * 2f, (R - dialW) * 2f),
+                style = Stroke(width = 1.dp.toPx())
+            )
+        }
 
         drawArc(
             color = Color.White.copy(alpha = 0.4f),
@@ -5436,7 +8042,589 @@ fun ZoomButton(
                 else -> Color.White
             },
             fontSize = 13.sp,
-            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+            // ★只旋转文字★
+            modifier = Modifier.rotate(LocalLabelRotation.current)
         )
+    }
+}
+
+// ==================== 侧边返回 / 多级菜单 / 调色盘 ====================
+
+/**
+ * ★侧边返回★：屏幕左边缘一条 22dp 的竖条，从左往右滑过阈值即触发返回。
+ *
+ * 只占边缘一条，中间的取景框照样可以双指拖动变焦，不会互相抢手势。
+ * 返回的层级由调用方的 onBack 决定（这里是 [CameraApp] 里的 goBack）。
+ */
+@Composable
+fun EdgeSwipeBack(
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    threshold: Dp = 56.dp,
+    onBack: () -> Unit
+) {
+    if (!enabled) return
+    Box(
+        modifier = modifier
+            .fillMaxHeight()
+            .width(22.dp)
+            .pointerInput(threshold) {
+                var fired = false
+                detectHorizontalDragGestures(
+                    onDragStart = { fired = false },
+                    onDragEnd = { fired = false },
+                    onDragCancel = { fired = false }
+                ) { change, dragAmount ->
+                    change.consume()
+                    // 向右滑、且累计位移过阈值才触发；fired 保证一次滑动只返回一次
+                    if (!fired && dragAmount > 0f && change.position.x >= threshold.toPx()) {
+                        fired = true
+                        onBack()
+                    }
+                }
+            }
+    )
+}
+
+@Composable
+private fun MenuItem(
+    text: String,
+    selected: Boolean = false,
+    onClick: () -> Unit
+) {
+    val haptic = LocalHapticFeedback.current
+    // ★交互动画★：按下时整行轻微缩小 + 底色泛白，抬手弹回
+    val src = remember { MutableInteractionSource() }
+    val bg = rememberPressColor(
+        interactionSource = src,
+        normal = Color.Transparent,
+        pressedColor = Color.White.copy(alpha = 0.12f)
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .bouncyPress(src, pressed = 0.97f)
+            .background(bg)
+            .clickable(
+                interactionSource = src,
+                indication = null
+            ) {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                onClick()
+            }
+            // 纵向内边距 11dp → 8dp：一屏能多放两三行，菜单整体矮一截
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text,
+            color = if (selected) Color(0xFFFFC107) else Color.White,
+            fontSize = 13.sp,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+            // ★防溢出★：文字过长时省略，绝不顶出菜单栏（以前会往左顶出去）
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            // ⚠️ 这里曾经加过 .rotate(LocalLabelRotation.current)，那是"横屏菜单文字重叠"的根因：
+            //    Modifier.rotate 只是【绘制变换】，不改变布局尺寸。菜单项是竖排的一列，
+            //    每行的文字各自转 90° 后，视觉高度变成原来的"文字宽度"（约 60~100dp），
+            //    而行高只有 40dp 出头 —— 相邻几行直接叠在一起。
+            //    正确做法是旋转【整个面板】（见 MultiLevelMenu 的 rotation 参数），
+            //    面板是浮层，整体转过去布局盒子也跟着转，不会互相压。
+            modifier = Modifier.weight(1f)
+        )
+        if (selected) Text("✓", color = Color(0xFFFFC107), fontSize = 13.sp)
+    }
+}
+
+/**
+ * ★多级菜单★：一级是分类（拍摄 / 录像 / 其他），点进去是二级具体项。
+ * 顶部 "<" 退回上一级；侧边返回和系统返回键会直接把整个菜单关掉。
+ *
+ * 所有可选项跟设置栏上的芯片是同一份状态（[SettingsBarState] / [SettingsBarActions]），
+ * 所以在菜单里改和在上面点效果完全一样，不会出现两边不同步。
+ */
+@Composable
+private fun MultiLevelMenu(
+    path: String,
+    onPathChange: (String?) -> Unit,
+    st: SettingsBarState,
+    act: SettingsBarActions,
+    modifier: Modifier = Modifier,
+    /**
+     * ★装不下的状态栏按键★：它们不再画成 chip，改在这里出现。
+     * 每个按键自带 [ChipSpec.menuEntries]，所以点这里和点 chip 效果完全一样。
+     */
+    overflow: List<ChipSpec> = emptyList(),
+    /**
+     * ★整个面板的旋转角★
+     * 界面没跟着屏幕转（UI 锁定竖屏）时，把整块菜单转过来，
+     * 这样文字是正的、菜单项是竖排的，跟平常一样能点。
+     */
+    rotation: Float = 0f,
+    /**
+     * ★内容区最大高度★：由外层按屏幕短边算好传进来，
+     * 菜单不再自己写死一个值，屏幕矮的机器也不会把菜单顶出屏幕。
+     */
+    maxContentHeight: Dp = MENU_MAX_HEIGHT_DP.dp
+) {
+    val haptic = LocalHapticFeedback.current
+    Box(
+        modifier = modifier
+            // ★整体旋转★：必须放在最外层，让背景 / 边框 / 内容一起转。
+            // 位置不需要补偿 —— 外层横屏时按 CenterEnd 摆放，旋转绕盒子中心，
+            // 居中时旋转前后中心不动，所以一定完整落在屏幕内。
+            .rotate(rotation)
+            // ★宽度自适应★：溢出项的文字可能比分类名长，写死 190dp 会顶出去。
+            // 给一个下限 + 上限，让 Box 按内容取宽度，同时不无限变宽。
+            // 上限收到 220dp：旋转 90° 后"高度"会变成"宽度"，太宽会顶出屏幕。
+            .widthIn(min = 190.dp, max = 220.dp)
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color.Black.copy(alpha = 0.88f))
+            .border(1.dp, Color.White.copy(alpha = 0.16f), RoundedCornerShape(16.dp))
+            .padding(vertical = 8.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                // 溢出项多的时候可以上下滑，不至于顶出屏幕。
+                // 上限由外层按屏幕高度算好（MENU_MAX_HEIGHT_DP / FRAC 取小），
+                // 旋转 90° 后它会变成面板的"宽度"，太大顶出屏幕。
+                .heightIn(max = maxContentHeight)
+                .verticalScroll(rememberScrollState())
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        if (path.isEmpty()) onPathChange(null) else onPathChange("")
+                    }
+                    .padding(horizontal = 14.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("<", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    if (path.isEmpty()) "设置" else path,
+                    color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(Color.White.copy(alpha = 0.12f))
+            )
+
+            // ★菜单只显示"设置栏上当前没有"的项★
+            // 顶部（竖屏）/ 左侧（横屏）那排芯片已有的按钮，菜单里不再重复，
+            // 免得同一个功能两个入口、改一处忘了另一处。
+            // 这些开关跟着模式走，所以菜单内容是自适应的：
+            //   拍照模式 → 设置栏没有画质/帧率/防抖，菜单的"录像设置"会自动补上
+            //   录像模式 → 设置栏没有高像素，菜单的"拍摄设置"会自动补上
+            val barHasHighRes: Boolean = !st.isFront && st.mode != CaptureMode.VIDEO
+            val barHasVideoChips: Boolean = st.mode == CaptureMode.VIDEO
+            val barHasRatio: Boolean = true
+            val barHasRotate: Boolean = true
+            val barHasFlash: Boolean = true
+            val barHasTone: Boolean = true
+
+            // 分类里一项都不剩时，一级菜单就不列这个分类（避免点进去是空页面）
+            val showPhotoGroup: Boolean = !barHasHighRes || !barHasRatio
+            val showVideoGroup: Boolean = !barHasVideoChips
+            val showOtherGroup: Boolean = !barHasRotate || !barHasFlash || !barHasTone
+
+            // ★二级切换动画★：进子页时新页从右侧滑入，退回时从左侧滑回。
+            //
+            // ⚠️ 之前是按"层级"算一个固定位移，结果退回一级后内容停在 -26dp 不动，
+            //    文字直接顶出菜单面板左侧 —— 就是这个 bug。
+            //    现在改成"每次切页先 snapTo 到起点，再 animateTo(0f)"，
+            //    动画结束一定回到 0，绝不会停在偏移位置。
+            val slideX = remember { Animatable(0f) }
+            LaunchedEffect(path) {
+                slideX.snapTo(if (path.isNotEmpty()) 28f else -28f)
+                slideX.animateTo(0f, tween(durationMillis = 220))
+            }
+            Crossfade(
+                targetState = path,
+                animationSpec = tween(durationMillis = 200)
+            ) { cur ->
+                Column(modifier = Modifier.offset(x = slideX.value.dp)) {
+                    when (cur) {
+                        "" -> {
+                            if (showPhotoGroup) MenuItem("拍摄设置") { onPathChange("拍摄设置") }
+                            if (showVideoGroup) MenuItem("录像设置") { onPathChange("录像设置") }
+                            if (showOtherGroup) MenuItem("其他") { onPathChange("其他") }
+                            // ★装不下的状态栏按键，在这里补齐★
+                            // 点这里和点 chip 是同一份动作，功能一个都不会少。
+                            overflow.forEach { spec ->
+                                spec.menuEntries.forEach { e ->
+                                    MenuItem(e.text, selected = e.selected) {
+                                        e.action()
+                                        // 打开面板类的（调色盘 / 闪光灯）点完就关菜单，
+                                        // 让面板盖上来；切换类的保留菜单，方便连着调
+                                        if (spec.id == CHIP_TONE || spec.id == CHIP_FLASH) {
+                                            onPathChange(null)
+                                        }
+                                    }
+                                }
+                            }
+                            // ★关于放在这里★：设置栏上已无常驻的"?"按钮
+                            MenuItem("关于") {
+                                act.onAbout()
+                                onPathChange(null)
+                            }
+                        }
+                        "拍摄设置" -> {
+                            if (!barHasHighRes) {
+                                MenuItem(
+                                    if (st.highResMode) "高像素：开" else "高像素：关",
+                                    selected = st.highResMode
+                                ) { act.onHighResChange(!st.highResMode) }
+                            }
+                            if (!barHasRatio) {
+                                PhotoRatio.values().forEach { r ->
+                                    MenuItem("比例 ${r.label}", selected = st.photoRatio == r) {
+                                        act.onPhotoRatioChange(r)
+                                    }
+                                }
+                            }
+                        }
+                        "录像设置" -> {
+                            if (!barHasVideoChips) {
+                                VideoQuality.values().forEach { q ->
+                                    MenuItem("画质 ${q.label}", selected = st.videoQuality == q) {
+                                        act.onVideoQualityChange(q)
+                                    }
+                                }
+                                VideoFrameRate.values().forEach { f ->
+                                    MenuItem("帧率 ${f.label}", selected = st.videoFrameRate == f) {
+                                        act.onVideoFrameRateChange(f)
+                                    }
+                                }
+                                MenuItem("防抖", selected = st.videoStabilization) {
+                                    act.onStabilizationChange(!st.videoStabilization)
+                                }
+                            }
+                        }
+                        "其他" -> {
+                            if (!barHasRotate) {
+                                MenuItem("自动旋转", selected = st.autoRotate) {
+                                    act.onAutoRotateChange(!st.autoRotate)
+                                }
+                            }
+                            if (!barHasFlash) {
+                                MenuItem("闪光灯") {
+                                    act.onFlashExpand()
+                                    onPathChange(null)
+                                }
+                            }
+                            if (!barHasTone) {
+                                MenuItem("调色盘") {
+                                    act.onColorPalette()
+                                    onPathChange(null)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * ★苹果风格调色盘★
+ * 横轴 = 色温（左冷右暖），纵轴 = 色调（上绿下洋红），下面一条强度滑条。
+ *
+ * 取景时预览会套上近似的色调（[CameraApp] 里的 toneOverlayColor），
+ * 成片由拍照后处理（postProcessPhoto）套用同一组增益，所以所见即所得。
+ */
+/**
+ * ★苹果柔光玻璃材质★
+ *
+ * 三层叠加模拟 iOS 的 materialThin / ultraThin 观感：
+ *   ① 底层：半透明黑 —— 提供对比度，保证在任何画面上都看得清
+ *   ② 中层：白色竖向渐变（上亮下暗）—— 模拟玻璃的厚度与透光
+ *   ③ 面层：顶部 1dp 高光 + 内圈柔光 —— 苹果玻璃最标志性的那道亮边
+ *
+ * ⚠️ 刻意不用 Modifier.blur()：那是 Android 12(API 31) 才真正生效的 RenderEffect，
+ *    低版本上是 no-op（还会打警告），而相机预览本身在动，玻璃后面透出画面就有"毛玻璃"感。
+ */
+/** 苹果柔光玻璃的白色渐变层（纯计算，不需要 Composable 上下文） */
+private fun appleGlassBrush(): Brush = Brush.verticalGradient(
+    colors = listOf(
+        Color.White.copy(alpha = 0.20f),
+        Color.White.copy(alpha = 0.11f),
+        Color.White.copy(alpha = 0.06f),
+        Color.White.copy(alpha = 0.09f)
+    )
+)
+
+@Composable
+fun AppleColorPalette(
+    warmth: Float,
+    tint: Float,
+    intensity: Float,
+    onWarmthChange: (Float) -> Unit,
+    onTintChange: (Float) -> Unit,
+    onIntensityChange: (Float) -> Unit,
+    onReset: () -> Unit,
+    onClose: () -> Unit,
+    /**
+     * ★横屏模式★
+     * 竖屏：底部弹出、铺满宽度、背景暗化（焦点在调色上）
+     * 横屏：贴右侧一小块、背景【不暗化】—— 横屏本来就是为了看着取景画面调色，
+     *       暗掉背景等于把预览挡了，失去了实时对照的意义。
+     */
+    landscape: Boolean = false
+) {
+    Dialog(
+        onDismissRequest = onClose,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                // ★横屏不暗化★：竖屏才压暗，横屏保持透明好对照取景
+                .background(
+                    if (landscape) Color.Transparent
+                    else Color.Black.copy(alpha = 0.45f)
+                )
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() }
+                ) { onClose() },
+            contentAlignment = if (landscape) Alignment.CenterEnd else Alignment.BottomCenter
+        ) {
+            // ★减小占屏★：
+            //   竖屏 → 宽度收到底部 82%，扁盘
+            //   横屏 → 贴右侧固定 230dp 宽的一小块，绝不铺满屏
+            Column(
+                modifier = (if (landscape) {
+                    Modifier
+                        .width(230.dp)
+                        .padding(end = 10.dp)
+                } else {
+                    Modifier
+                        .fillMaxWidth(0.82f)
+                        .padding(12.dp)
+                })
+                    // ③ 玻璃底：半透明黑打底
+                    .clip(RoundedCornerShape(26.dp))
+                    .background(Color.Black.copy(alpha = 0.42f))
+                    // ② 玻璃层：白色竖向渐变
+                    .background(brush = appleGlassBrush())
+                    // ① 高光边：苹果玻璃最标志性的那道顶边 + 一圈极淡描边
+                    .border(
+                        width = 1.dp,
+                        brush = Brush.verticalGradient(
+                            colors = listOf(
+                                Color.White.copy(alpha = 0.45f),
+                                Color.White.copy(alpha = 0.10f),
+                                Color.White.copy(alpha = 0.16f)
+                            )
+                        ),
+                        shape = RoundedCornerShape(26.dp)
+                    )
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() }
+                    ) { /* 吃掉点击，避免点到面板就关闭 */ }
+                    .padding(12.dp)
+            ) {
+                // 标题 + 复位合成一行，省掉一整行的高度
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "调色",
+                        color = Color.White,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    Text(
+                        "复位",
+                        color = Color.White.copy(alpha = 0.7f),
+                        fontSize = 12.sp,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color.White.copy(alpha = 0.14f))
+                            .clickable { onReset() }
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // ── 二维调色盘（扁盘，不再占满整屏）──
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(if (landscape) 1.15f else 1.55f)
+                        .clip(RoundedCornerShape(16.dp))
+                        .border(
+                            width = 1.dp,
+                            color = Color.White.copy(alpha = 0.22f),
+                            shape = RoundedCornerShape(16.dp)
+                        )
+                        .pointerInput(Unit) {
+                            detectDragGestures { change, _ ->
+                                change.consume()
+                                val nx = (change.position.x / size.width).coerceIn(0f, 1f)
+                                val ny = (change.position.y / size.height).coerceIn(0f, 1f)
+                                onWarmthChange((nx - 0.5f) * 200f)
+                                onTintChange((ny - 0.5f) * 200f)
+                            }
+                        }
+                ) {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val w = size.width
+                        val h = size.height
+                        val cell = 28f
+                        var x = 0f
+                        while (x < w) {
+                            var y = 0f
+                            while (y < h) {
+                                val nx = x / w
+                                val ny = y / h
+                                val warm = (nx - 0.5f) * 2f
+                                val tintV = (ny - 0.5f) * 2f
+                                val r = (0.5f + 0.45f * warm + 0.12f * tintV).coerceIn(0f, 1f)
+                                val g = (0.5f - 0.30f * tintV).coerceIn(0f, 1f)
+                                val b = (0.5f - 0.45f * warm + 0.12f * tintV).coerceIn(0f, 1f)
+                                drawRect(
+                                    color = Color(r, g, b),
+                                    topLeft = Offset(x, y),
+                                    size = GeoSize(cell, cell)
+                                )
+                                y += cell
+                            }
+                            x += cell
+                        }
+
+                        // ★柔光玻璃质感★：盘面上覆一层顶部亮、底部暗的柔和光晕，
+                        // 再叠一道顶部高光 —— 就是 iOS 调色盘那种"光从上方打过来"的感觉
+                        drawRect(
+                            brush = Brush.verticalGradient(
+                                colors = listOf(
+                                    Color.White.copy(alpha = 0.16f),
+                                    Color.White.copy(alpha = 0.03f),
+                                    Color.Black.copy(alpha = 0.06f)
+                                ),
+                                startY = 0f,
+                                endY = h
+                            )
+                        )
+                        drawLine(
+                            color = Color.White.copy(alpha = 0.35f),
+                            start = Offset(0f, 1.dp.toPx()),
+                            end = Offset(w, 1.dp.toPx()),
+                            strokeWidth = 1.dp.toPx()
+                        )
+
+                        // 当前所在位置：先描一圈黑边，再画白圈，深色区也看得清
+                        val px = (warmth / 200f + 0.5f).coerceIn(0f, 1f) * w
+                        val py = (tint / 200f + 0.5f).coerceIn(0f, 1f) * h
+                        drawCircle(
+                            color = Color.Black.copy(alpha = 0.45f),
+                            radius = 10.dp.toPx(),
+                            center = Offset(px, py),
+                            style = Stroke(width = 4.dp.toPx())
+                        )
+                        drawCircle(
+                            color = Color.White,
+                            radius = 9.dp.toPx(),
+                            center = Offset(px, py),
+                            style = Stroke(width = 2.dp.toPx())
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // ── 强度（与色温/色调数值合成一行）──
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "强度",
+                        color = Color.White.copy(alpha = 0.8f),
+                        fontSize = 12.sp
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(28.dp)
+                            .pointerInput(Unit) {
+                                detectDragGestures { change, _ ->
+                                    change.consume()
+                                    val frac = (change.position.x / size.width).coerceIn(0f, 1f)
+                                    onIntensityChange(frac * 100f)
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val y = size.height / 2f
+                            drawLine(
+                                color = Color.White.copy(alpha = 0.2f),
+                                start = Offset(0f, y),
+                                end = Offset(size.width, y),
+                                strokeWidth = 3.dp.toPx(),
+                                cap = StrokeCap.Round
+                            )
+                            val fx = size.width * (intensity / 100f).coerceIn(0f, 1f)
+                            drawLine(
+                                color = Color(0xFFFFC107),
+                                start = Offset(0f, y),
+                                end = Offset(fx, y),
+                                strokeWidth = 3.dp.toPx(),
+                                cap = StrokeCap.Round
+                            )
+                            drawCircle(
+                                color = Color.White,
+                                radius = 7.dp.toPx(),
+                                center = Offset(fx, y)
+                            )
+                        }
+                    }
+                    Text(
+                        "${intensity.roundToInt()}",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        modifier = Modifier.width(34.dp),
+                        textAlign = TextAlign.End
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // 只剩一个"完成"，复位已挪到标题行
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(38.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(
+                            brush = Brush.verticalGradient(
+                                colors = listOf(
+                                    Color(0xFFFFD54F),
+                                    Color(0xFFFFC107)
+                                )
+                            )
+                        )
+                        .clickable { onClose() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "完成",
+                        color = Color.Black,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
     }
 }
