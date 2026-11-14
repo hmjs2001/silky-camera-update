@@ -1,4 +1,4 @@
-package com.example.myapplication
+package com.example.hmjs
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -62,9 +62,12 @@ import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.Easing
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.Spring
@@ -102,7 +105,6 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -114,6 +116,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.draw.rotate
@@ -147,6 +150,7 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -193,6 +197,603 @@ import kotlin.math.sin
 import androidx.camera.core.ImageProxy
 import androidx.compose.material3.Slider
 import kotlinx.coroutines.isActive
+
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.Outline
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.layout.layout
+import androidx.compose.foundation.interaction.PressInteraction
+import kotlinx.coroutines.flow.collect
+
+
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  本次补丁块（全部为新增代码，原有代码一字未动）                    ║
+// ╚══════════════════════════════════════════════════════════════════╝
+
+/** 间距令牌：只用 4 / 8 / 12 / 16 / 24 / 32 dp；组内间距 < 组间间距 */
+object UiSpace {
+    val xs: Dp = 4.dp
+    val sm: Dp = 8.dp
+    val md: Dp = 12.dp
+    val lg: Dp = 16.dp
+    val xl: Dp = 24.dp
+    val xxl: Dp = 32.dp
+}
+
+/** 圆角令牌：只用 6 / 10 / 16 dp */
+object UiRadius {
+    val s: Dp = 6.dp
+    val m: Dp = 10.dp
+    val l: Dp = 16.dp
+}
+
+/**
+ * ★★闪光灯弹出面板动画★★
+ *
+ * 只用于闪光灯那排图标的小面板。录像画质改成了「整条参数栏从左往右
+ * 缓慢展开」(QUALITY_STRIP_ENTER / QUALITY_STRIP_EXIT)，不再共用这一份。
+ *   · 120ms 淡入 + 从 0.75 倍 MediumBouncy 弹簧放大（先略过冲再回 100%）
+ *   · 100ms 淡出 + 缩到 0.85 倍
+ *
+ * ⚠️ 显式声明 EnterTransition / ExitTransition 类型、右值全是外部函数调用，
+ *    不引用本文件任何属性 —— 避免自引用初始化触发 Kotlin 递归类型推断。
+ */
+private val POPUP_ENTER: EnterTransition = fadeIn(tween(120)) + scaleIn(
+    animationSpec = spring(
+        dampingRatio = Spring.DampingRatioMediumBouncy,
+        stiffness = Spring.StiffnessMedium
+    ),
+    initialScale = 0.75f
+)
+private val POPUP_EXIT: ExitTransition =
+    fadeOut(tween(100)) + scaleOut(targetScale = 0.85f)
+
+/**
+ * ★★录像画质：整条参数栏【向右弹出】★★
+ *
+ * 不是单独弹一个小面板，也不是原地被「揭开」—— 而是整条不透明的画质选择条
+ * 从左侧屏幕外【整体向右滑入】，到位后铺满整条录制参数状态栏、盖掉原 chips。
+ *
+ *   · slideInHorizontally(initialOffsetX = { -it })：it 是内容宽度，
+ *     -it = 起点在左侧一个身位之外，动画中整条朝右移动到位 —— 这就是「向右弹出」
+ *   · 560ms / FastOutSlowInEasing，比闪光灯面板 120ms 的弹簧小弹出明显慢，从容
+ *   · 收起 slideOutHorizontally(targetOffsetX = { -it })：朝左滑出，方向互为反向
+ *   · fadeIn(160) / fadeOut(140) 只做轻微辅助，不抢横向滑入的主体感
+ *
+ * 调参：
+ *   · 快慢 → 只改下面两个毫秒数
+ *   · 完全匀速 → easing 换 LinearEasing
+ *   · 想改成「从右往左弹出」→ 把两处 -it 改成 it（一行一个）
+ *
+ * ⚠️ 显式声明 EnterTransition / ExitTransition 类型、右值全是外部函数调用，
+ *    不引用本文件任何属性 —— 避免自引用初始化触发 Kotlin 递归类型推断。
+ */
+private const val QUALITY_STRIP_ENTER_MS: Int = 560
+private const val QUALITY_STRIP_EXIT_MS: Int = 400
+
+private val QUALITY_STRIP_ENTER: EnterTransition = slideInHorizontally(
+    initialOffsetX = { fullWidth: Int -> -fullWidth },
+    animationSpec = tween(
+        durationMillis = QUALITY_STRIP_ENTER_MS,
+        easing = FastOutSlowInEasing
+    )
+) + fadeIn(tween(durationMillis = 160))
+
+private val QUALITY_STRIP_EXIT: ExitTransition = slideOutHorizontally(
+    targetOffsetX = { fullWidth: Int -> -fullWidth },
+    animationSpec = tween(
+        durationMillis = QUALITY_STRIP_EXIT_MS,
+        easing = FastOutSlowInEasing
+    )
+) + fadeOut(tween(durationMillis = 140))
+
+/**
+ * 中性色 + 唯一强调色。
+ * ⚠️ 所有成员显式声明 Color 类型（接收者类型确定，.copy 不会被级联推断拖垮）。
+ * 录制红属于「功能性状态色」，不算装饰性强调色。
+ */
+/**
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  ★★上方参数栏：颜色 / 对比度旋钮 —— 只改下面 6 个数★★          ║
+ * ╚══════════════════════════════════════════════════════════════╝
+ *
+ * 全部是中性灰阶，不含彩色。想整体调节时不必翻到下面逐个找控件：
+ *   · 想更「轻」、更透：把 SURFACE_ALPHA 调小、LINE_ALPHA 调大
+ *     （靠描边给边界，而不是靠堆不透明度 —— 这样顶部不会像压了一块黑板）
+ *   · 想更「实」、更醒目：反过来
+ *   · 想微调色温：改下面 UiColor 里那两行 Color(0xFF...) 的字面量，
+ *     三个通道等量偏移即可，别引入第二种色相
+ *
+ * 三档预设（改下面 4 个 alpha 即可）：
+ *   轻盈  0.78 / 0.90 / 0.52 / 0.80
+ *   标准  0.84 / 0.94 / 0.48 / 0.76   ← 当前默认
+ *   强    0.92 / 0.98 / 0.40 / 0.70
+ *
+ * ⚠️ 不把 ARGB 抽成 Int 常量：0xFF171717 超过 Int.MAX_VALUE，Kotlin 会推断为
+ *    Long，写 `const val x: Int = 0xFF171717` 反而编译不过。保留原字面量最稳。
+ *    所有 val 显式声明 : Color，右值只引用常量，不引用 UiColor 自己
+ *    （自引用初始化会触发 Kotlin 递归类型推断，前几轮踩过）。
+ */
+//
+// ── ★★透明色亚克力材质（拍摄界面所有按键 / 菜单 / 浮层共用一套）★★ ──
+//
+// 参考 Microsoft Fluent Acrylic 的五层配方：背景 / 高斯模糊 / 明度混合 /
+// 颜色混合 / 噪点层（TintColor + TintOpacity + TintLuminosityOpacity +
+// FallbackColor），以及 haze GlassStyle.clear 的 tint = White 0.16。
+//
+// 这里【不真做模糊】，原因和历史完全相同：PreviewView 在 PERFORMANCE 模式下
+// 是 SurfaceView，像素无法被捕获；在预览上叠离屏层 / RenderEffect 会破坏
+// Compose 给 SurfaceView 打的透明洞 —— 正是「一调色就全黑」的根因。
+// 所以只复刻亚克力的【视觉分层】，全部是普通 draw call：
+//   ① 明度混合层（极淡暗色）→ 保证黑字在亮画面下仍有对比
+//   ② TintColor 层（冷调浅灰 #E8EAED，低不透明度）→ 主体，背景基本透出
+//   ③ 单层亮边 + 顶部 specular rim → 亚克力靠边缘光学勾轮廓
+//
+// 仍守住 UI 规范：无发光、无彩色阴影、边框只套一层、中性色为主、
+// 唯一强调色仍是橙色。全文零渐变：黑边过渡已取消，控件材质也用纯色。
+//
+/** Acrylic TintOpacity：面板中心填充，比原来的 0.90 实心白透得多 */
+private const val ACRYLIC_TINT_ALPHA: Float = 0.30f
+/** 强调态（选中 / 按下 / 菜单入口）：稍实一档，保证入口一眼可见 */
+private const val ACRYLIC_HI_ALPHA: Float = 0.48f
+/** 小按键：最透一档 */
+private const val ACRYLIC_PARAM_ALPHA: Float = 0.24f
+/**
+ * ★TintLuminosityOpacity 等价层★：一层极淡暗色，托住亮天空下的黑字。
+ * 这层正是 haze 文档说的「Clear over bright content, add a dark dimming
+ * layer behind the controls when needed for contrast」。
+ * 设 0f = 完全纯透明（但亮画面下文字会偏淡）。
+ */
+private const val ACRYLIC_LUMINOSITY_ALPHA: Float = 0.06f
+/** 亚克力亮边：白 52%，边缘光学轮廓（不是发光、不是第二层边框） */
+private const val ACRYLIC_EDGE_ALPHA: Float = 0.52f
+/** 单层中性描边：设置页白底弹窗 / 协议门仍用黑边，不跟着翻白 */
+private const val CHROME_LINE_ALPHA: Float = 0.14f
+private const val CHROME_LINE_HI_ALPHA: Float = 0.28f
+
+// ── ★★统一中性灰阶：全文 UI 只用这一套令牌，禁止再散写 alpha★★ ──
+//
+// 之前全文散着 24 种 Color.Black.copy(alpha = …)（0.04 / 0.05 / 0.06 /
+// 0.07 / 0.08 / 0.1 / 0.12 / 0.15 / 0.16 / 0.18 / 0.2 / 0.22 / 0.3 /
+// 0.35 / 0.4 / 0.45 / 0.5 / 0.55 / 0.6 / 0.62 / 0.7 / 0.72 / 0.75 /
+// 0.8 / 0.85），同一层级的文字在不同页面深浅都不一样。现在按语义收成
+// 「主文字 Ink + 次级 TextDim + 三级 TextFaint + 浅底 Wash + 分隔线 Line
+// + 描边 Border + 按压 GlassPressed + 遮罩 Scrim」一套，全部从 UiColor.*
+// 取；改一个常量，整套界面一起变。
+//
+// 例外（刻意保留，不属于 UI 灰阶）：专业滑条轨道/刻度、变焦轮盘刻度、
+// 调色盘 Canvas 绘制、预览上的功能性遮罩、参数栏竖线（压在亚克力上）。
+//
+/** 次级文字 / 说明 / 数值 */
+private const val INK_DIM_ALPHA: Float = 0.55f
+/** 三级文字：脚注、弱化态、项目符号 */
+private const val INK_FAINT_ALPHA: Float = 0.35f
+/** 浅底条目 / 卡片 / 可点击行 */
+private const val INK_WASH_ALPHA: Float = 0.05f
+/** 分隔线 */
+private const val INK_LINE_ALPHA: Float = 0.10f
+/** 单层描边 */
+private const val INK_BORDER_ALPHA: Float = 0.08f
+/** 按压反馈 */
+private const val INK_PRESS_ALPHA: Float = 0.10f
+/** 全屏 Dialog 遮罩（原 0xF20D0D0D 接近纯黑，统一成中性半透黑） */
+private const val SCRIM_ALPHA: Float = 0.55f
+
+// ── ★★视觉对齐令牌★★ ──
+// 所有菜单 / 面板 / 设置卡片共用同一套：左边缘、同心圆角、间距档位。
+// 这样「同一列元素共用左边缘」「嵌套圆角：外 = 内 + 内边距」才真正成立。
+/** 内容统一左边缘（菜单行、标题行、分隔线、卡片内条目一律用它） */
+private const val MENU_EDGE_DP: Int = 16
+/** 外圆角 / 内圆角：16 = 10 + 8dp 内边距（同心） */
+private const val MENU_RADIUS_OUTER_DP: Int = 16
+private const val MENU_RADIUS_INNER_DP: Int = 10
+
+// ── ★★参考开源玻璃项目的视觉配方★★ ──
+// chrisbanes/haze (Apache-2.0) 的 GlassStyle.regular：
+//   · blur 20/24/25dp 随 surface 最短边 64/176/220dp 分级 —— 小控件更透、大面板更实
+//   · tint Color.White.copy(alpha = 0.16f)、specular rim 高光、shape 20dp
+// LiquidGlass (iOS 26 风格) 的 Fallback 档：
+//   · 0dp blur、flat tint + edge sheen、零离屏缓冲，低端机优雅降级
+// ComposeGlassmorphism (MIT)：单层细描边 + 半透明底，不用渐变
+//
+// ⚠️ 不能直接引入这三个依赖，两个硬原因：
+//   ① 工程只有这一份 .kt，没有 build.gradle，加 implementation 必然编译失败；
+//   ② Haze 官方文档明确写了：CameraX 的 PreviewView 在 PERFORMANCE 模式下是
+//      SurfaceView，像素无法被 hazeSource 捕获（要改 COMPATIBLE）；而在预览上
+//      叠离屏层正是之前「一调色就全黑」的根因。
+// 所以只复刻【视觉配方】，用纯 Compose 绘制、零依赖、零离屏层、零 RenderEffect：
+//   · 尺寸分级 TintOpacity（小按键 0.24 / 面板 0.30 / 强调 0.48）代替分级 blur
+//   · 明度混合层 + 顶部 1dp specular rim + 单层亮边（亚克力边缘光学）
+//   · 同心圆角；透明亚克力比旧版 0.90 实心白透得多
+//
+/** 顶部 specular rim：纯色 1dp 实线，内缩到统一左边缘 */
+private const val GLASS_RIM_ALPHA: Float = 0.72f
+
+/**
+ * ★参数栏翻转【瞬态】伴随幅度★
+ *
+ * 旧实现把动画角按固定系数直接当成倾斜角：spin 在横屏静止时是 ±90，
+ * 整条参数栏就永久歪 1.35°；倒置 180° 歪 2.7° —— 正是「水平状态下
+ * 翻转屏幕参数栏倾斜」的根因。现在改成只在翻转【过程中】给一点呼应，
+ * 端点严格回到 0° / 100%（见 spinWithUi）。
+ */
+/** 翻转中途最大倾斜角（度），端点为 0 */
+private const val UI_SPIN_FOLLOW_DEG: Float = 1.35f
+private const val UI_SPIN_SCALE_DROP: Float = 0.025f
+/** 文字转正 / 参数栏翻转的动画时长(ms)，与变焦同属一套 motion */
+private const val UI_ROTATE_MS: Int = 420
+
+/**
+ * ★★配色主题★★
+ *
+ * 全应用只有一个【深浅体系】：不透明白底 + 近黑字。
+ * 拍摄预览界面上的浮层：透明色亚克力 + 近黑字 + 亮边（玻璃材质）。
+ * 两者只是底材不同，文字与灰阶共用同一套 UiColor 令牌；
+ * 原先 4 个深色底弹窗（近黑字根本读不清）已一并统一成白底。
+ * 强调色仍只有 Accent 一种（橙），录制红是功能性状态色。
+ * 想微调只改这里，全文的 UiColor.* 会一起跟着变。
+ */
+object UiColor {
+    /** 主前景 / 主文字：近黑（不是纯黑，长时间看更柔和） */
+    // ── ★透明亚克力令牌★（全是字面量，不引用本 object 内其它 val，杜绝前向引用）──
+    // TintColor 用 Fluent Acrylic 常用的冷调浅灰 #E8E8E8 系：比纯白略暗，
+    // 叠在亮天空上能压住一点、叠在暗夜景上能提亮一点，黑字两头都读得清。
+    /** 按键常态亚克力底：最透一档 */
+    val Glass: Color = Color(0xFFE8EAED).copy(alpha = ACRYLIC_PARAM_ALPHA)
+    /** 选中 / 按下 / 菜单入口：稍实一档 */
+    val GlassHi: Color = Color(0xFFE8EAED).copy(alpha = ACRYLIC_HI_ALPHA)
+    /** ★面板级亚克力★ */
+    val GlassPanel: Color = Color(0xFFE8EAED).copy(alpha = ACRYLIC_TINT_ALPHA)
+    /** ★明度混合层★：极淡暗色，托住亮画面下的文字；0f 即纯透明 */
+    val AcrylicDim: Color = Color.Black.copy(alpha = ACRYLIC_LUMINOSITY_ALPHA)
+    /** ★亚克力亮边★：只给预览浮层用（白底设置弹窗继续用 GlassLine 黑边） */
+    val GlassEdge: Color = Color.White.copy(alpha = ACRYLIC_EDGE_ALPHA)
+    /** ★顶部 specular rim★：纯白 1dp 实线（非渐变/发光） */
+    val GlassRim: Color = Color.White.copy(alpha = GLASS_RIM_ALPHA)
+    /** 单层中性描边：设置页白底弹窗 / 协议门 / 部分圆形键 */
+    val GlassLine: Color = Color.Black.copy(alpha = CHROME_LINE_ALPHA)
+    /** 按下反馈：轻压暗，不是白闪 */
+    val GlassPressed: Color = Color.Black.copy(alpha = INK_PRESS_ALPHA)
+    /** 玻璃内部那层极淡的透光（纯色，不用渐变） */
+    val GlassSheen: Color = Color.White.copy(alpha = 0.06f)
+
+    val Ink: Color = Color(0xFF121212)
+    /**
+     * ★设置界面 / 全屏页 / 对话框：普通材质（不透明白）★
+     * 只有拍摄预览界面上的浮层用下面的 Glass* 玻璃令牌，两者彻底分开。
+     * 全应用只有一个深浅体系：白底 + 近黑字，不再有深色弹窗。
+     */
+    val Surface: Color = Color(0xFFFBFBFB)
+    /** 高一档底色：浅灰（次级按钮 / 图片占位 / 开关轨道） */
+    val SurfaceHi: Color = Color(0xFFECECEC)
+    /** ★统一灰阶★ 分隔线 */
+    val Line: Color = Color.Black.copy(alpha = INK_LINE_ALPHA)
+    /** ★统一灰阶★ 单层描边 */
+    val Border: Color = Color.Black.copy(alpha = INK_BORDER_ALPHA)
+    /** ★统一灰阶★ 浅底条目 / 卡片 */
+    val Wash: Color = Color.Black.copy(alpha = INK_WASH_ALPHA)
+    /** ★统一灰阶★ 全屏 Dialog 遮罩 */
+    val Scrim: Color = Color.Black.copy(alpha = SCRIM_ALPHA)
+    /** 主文字：近黑 */
+    val Text: Color = Color(0xFF121212)
+    /** ★统一灰阶★ 次级文字 */
+    val TextDim: Color = Color.Black.copy(alpha = INK_DIM_ALPHA)
+    /** ★统一灰阶★ 三级文字 / 脚注 / 弱化态 */
+    val TextFaint: Color = Color.Black.copy(alpha = INK_FAINT_ALPHA)
+    /** 唯一强调色 */
+    val Accent: Color = Color(0xFFFFA000)
+    /** 录制状态色（功能性，不算装饰强调色） */
+    val Recording: Color = Color(0xFFE53935)
+
+    // ── ★取景画面上的控件：透明亚克力★ ──
+    // 顶部按钮、菜单面板、闪光面板、画质条、变焦键、模式栏共用同一份材质。
+    // 低不透明度的冷浅灰 TintColor + 亮边，背景基本透出来；不再是实心白块。
+    /** 常态底色：透明亚克力 */
+    val Chrome: Color = Color(0xFFE8EAED).copy(alpha = ACRYLIC_PARAM_ALPHA)
+    /** 更高一档：选中 / 按下 / 菜单入口 */
+    val ChromeHi: Color = Color(0xFFE8EAED).copy(alpha = ACRYLIC_HI_ALPHA)
+    /** 中性描边（设置页弹窗 / 圆形键等仍走这一组） */
+    val ChromeLine: Color = Color.Black.copy(alpha = CHROME_LINE_ALPHA)
+    val ChromeLineHi: Color = Color.Black.copy(alpha = CHROME_LINE_HI_ALPHA)
+
+    // ── ★参数调整栏：按键文字无底板 + 白字 + 淡灰竖线「|」★ ──
+    // 拍摄界面上的 chip / 模式文字直接浮在取景画面上，用 PreviewText 白字；
+    // 有面板底板的控件（菜单、闪光面板、专业圆键…）仍用 Ink / ParamText 黑字。
+    val ParamBg: Color = Color(0xFFE8EAED).copy(alpha = ACRYLIC_PARAM_ALPHA)
+    /** 有底板的圆键 / 滑条仍用近黑字（白字在浅亚克力底上会看不清） */
+    val ParamText: Color = Color(0xFF121212)
+    val ParamTextDim: Color = Color.Black.copy(alpha = INK_DIM_ALPHA)
+
+    // ── ★拍摄界面文字：白★ ──
+    // 只给【没有底板、直接浮在取景画面上】的控件用（TopChip / 模式栏）。
+    // 菜单、闪光面板、调色盘、专业圆键、变焦圆钮、设置/关于/协议等有面板
+    // 或圆底的控件保持黑字 —— 白字压在浅亚克力上会完全读不出来。
+    val PreviewText: Color = Color.White
+    val PreviewTextDim: Color = Color.White.copy(alpha = 0.78f)
+    /** 淡灰色竖线「|」：连续实线；白字排版下改浅白，亮/暗画面都看得见 */
+    val ParamDivider: Color = Color.White.copy(alpha = 0.35f)
+}
+
+private val UI_ALLOWED_RADII: List<Dp> = listOf(UiRadius.s, UiRadius.m, UiRadius.l)
+
+/**
+ * ★连续曲率圆角（squircle）★
+ *
+ * 【同名覆盖】原文件 import 的是库的 RoundedCornerShape，这里把 import 删掉、
+ * 定义同名顶层函数，全文 69 处 RoundedCornerShape(...) 调用【一行都不用改】
+ * 就全部变成连续曲率 + 半径吸附到 6/10/16。
+ *
+ * 圆弧与直线相接处曲率会突跳；n=4 超椭圆在端点曲率趋于 0，与直线 G2 连续，
+ * 即 iOS / Figma 的「平滑圆角」。
+ * ⚠️ 一律用 Outline.Generic(Path)，不碰 Rectangle 变体 —— 它在不同 Compose
+ *    版本里可能是 object 也可能需要构造参数，直接返回会编译失败。
+ */
+fun RoundedCornerShape(radius: Dp): Shape {
+    val requested: Float = radius.value
+    // 吸附到最近的允许半径
+    var snapped: Float = UiRadius.s.value
+    var best: Float = abs(UiRadius.s.value - requested)
+    for (i in UI_ALLOWED_RADII.indices) {
+        val d: Float = abs(UI_ALLOWED_RADII[i].value - requested)
+        if (d < best) {
+            best = d
+            snapped = UI_ALLOWED_RADII[i].value
+        }
+    }
+    return object : Shape {
+        override fun createOutline(
+            size: GeoSize,
+            layoutDirection: LayoutDirection,
+            density: Density
+        ): Outline {
+            val path = Path()
+            val w: Float = size.width
+            val h: Float = size.height
+            if (requested <= 0f || w <= 0f || h <= 0f) {
+                path.moveTo(0f, 0f)
+                path.lineTo(w, 0f)
+                path.lineTo(w, h)
+                path.lineTo(0f, h)
+                path.close()
+                return Outline.Generic(path)
+            }
+            val r: Float = (snapped * density.density)
+                .coerceIn(0f, kotlin.math.min(w, h) / 2f)
+            val steps: Int = 12
+            val q: Float = (Math.PI / 2.0).toFloat()
+            fun ss(a: Float): Float =
+                kotlin.math.sqrt(sin(a).coerceIn(0f, 1f).toDouble()).toFloat()
+            fun cc(a: Float): Float =
+                kotlin.math.sqrt(cos(a).coerceIn(0f, 1f).toDouble()).toFloat()
+            path.moveTo(r, 0f)
+            path.lineTo(w - r, 0f)
+            for (i in 1..steps) {
+                val a: Float = q * i / steps
+                path.lineTo(w - r + r * ss(a), r - r * cc(a))
+            }
+            path.lineTo(w, h - r)
+            for (i in 1..steps) {
+                val a: Float = q * i / steps
+                path.lineTo(w - r + r * cc(a), h - r + r * ss(a))
+            }
+            path.lineTo(r, h)
+            for (i in 1..steps) {
+                val a: Float = q * i / steps
+                path.lineTo(r - r * ss(a), h - r + r * cc(a))
+            }
+            path.lineTo(0f, r)
+            for (i in 1..steps) {
+                val a: Float = q * i / steps
+                path.lineTo(r - r * cc(a), r - r * ss(a))
+            }
+            path.close()
+            return Outline.Generic(path)
+        }
+    }
+}
+
+/**
+ * 嵌套同心圆角：外圆角 = 内圆角 + 内边距。
+ * 提供给新代码使用；历史布局的圆角由上面的同名覆盖统一吸附，不强行重排。
+ */
+fun nestedRadius(inner: Dp, padding: Dp): Dp = inner + padding
+
+/**
+ * ★修复 Bug1：横屏长文案被裁★
+ *
+ * Modifier.rotate 只改【绘制】不改【测量】，父容器仍按「一行字高」给空间，
+ * 文字转 90° 后「光学防抖」这类 4 字文案就被板块裁掉。
+ * 这里在 layout 阶段把宽高对调，父容器自然给出足够高度；
+ * 角度 0°/180° 时原样返回，竖屏零影响。
+ * 传入 text 时按 [ROTATE_LABEL_MAX_CHARS] 判断：超过 4 个字符不旋转。
+ */
+/** 允许旋转的最大字符数：超过就不转（长文案横屏保持原样，不被裁、不挤占相邻按键） */
+private const val ROTATE_LABEL_MAX_CHARS: Int = 4
+
+@Composable
+fun Modifier.rotatedLabel(text: String = ""): Modifier {
+    //
+    // ★★按文字长度决定是否旋转★★
+    //
+    //   · 超过 4 个字符 → 完全不旋转、也不交换测量盒（return this，竖屏横屏都原样）
+    //   · 4 个字符以内 → 旋转，并且在侧向时交换测量盒【增加】出足够高度，
+    //     让转正后的文字有空间摆下；全程连续 rotate，不再"啪"地一下硬切
+    //
+    // 其它调用点不传 text（默认 ""）→ 保持原有行为，一行都不用改；
+    // 只有顶部参数栏的 TopChip 把按钮文案传进来，一处覆盖全部菜单按键。
+    // 中文按 1 个字符计（String.length），如「光学防抖」=4 旋转、
+    // 「1080P」=5 不旋转、「画质 1080P」不旋转。
+    //
+    if (text.length > ROTATE_LABEL_MAX_CHARS) return this
+    val degrees: Float = LocalLabelRotation.current
+    var d: Float = degrees % 180f
+    if (d < 0f) d += 180f
+    //
+    // ★★参数栏翻转动画：修掉「硬切」★★
+    //
+    // 原来只在 abs(d-90)<1 时生效，其余角度直接 return this（完全不转）。
+    // 而 LocalLabelRotation 下发的是 animateFloatAsState 的动画值 ——
+    // 于是 0→90 的整个动画过程中文字一动不动，到最后一帧突然
+    // 「宽高交换 + rotate(90)」蹦过去，看着就是"啪"地一下翻过来。
+    //
+    // 现在：任何角度都持续 rotate(degrees)，全程连续旋转；
+    // 只有接近侧向（45°~135°）才交换测量盒，给转正后的文字留出足够高度
+    // （角度接近 90° 时宽高对调的视觉差异最小，切过去几乎看不出布局跳变）。
+    // 0°/180° 附近不交换，竖屏零影响，Bug1 的长文案防裁切依旧成立。
+    //
+    val sideways: Boolean = d > 45f && d < 135f
+    if (!sideways) return this.rotate(degrees)
+    return this.layout { measurable, constraints ->
+        val placeable = measurable.measure(
+            constraints.copy(
+                minWidth = 0,
+                minHeight = 0,
+                maxWidth = Constraints.Infinity,
+                maxHeight = Constraints.Infinity
+            )
+        )
+        layout(placeable.height, placeable.width) {
+            placeable.place(
+                (placeable.height - placeable.width) / 2,
+                (placeable.width - placeable.height) / 2
+            )
+        }
+    }.rotate(degrees)
+}
+
+/**
+ * ★触点波纹★：从手指按下的位置生成圆形波纹向外扩散，不是从按钮中心。
+ *
+ * 刻意【不实现 Indication】：新版 Compose 的 Indication 已迁到
+ * IndicationNodeFactory / Modifier.Node，旧回调式签名会触发递归类型检查。
+ * 这里只读 clickable 传入的 InteractionSource 流，取
+ * PressInteraction.Press.pressPosition 作圆心，纯 drawWithContent 绘制。
+ * ⚠️ 必须放在 .clickable(...) 之前，外层 clip 会把波纹限制在圆角内。
+ */
+@Composable
+fun Modifier.touchRipple(interactionSource: MutableInteractionSource): Modifier {
+    var origin by remember { mutableStateOf<androidx.compose.ui.geometry.Offset?>(null) }
+    val progress = remember { Animatable(0f) }
+    var rippleJob: Job? by remember { mutableStateOf<Job?>(null) }
+    LaunchedEffect(interactionSource) {
+        interactionSource.interactions.collect { ev ->
+            when (ev) {
+                is PressInteraction.Press -> {
+                    origin = ev.pressPosition
+                    rippleJob?.cancel()
+                    rippleJob = launch {
+                        progress.snapTo(0f)
+                        progress.animateTo(
+                            1f,
+                            tween(durationMillis = 420, easing = FastOutSlowInEasing)
+                        )
+                    }
+                }
+                is PressInteraction.Release -> {
+                    rippleJob?.cancel()
+                    rippleJob = launch {
+                        progress.animateTo(1f, tween(durationMillis = 160))
+                        origin = null
+                    }
+                }
+                is PressInteraction.Cancel -> {
+                    rippleJob?.cancel()
+                    origin = null
+                }
+            }
+        }
+    }
+    return this.drawWithContent {
+        drawContent()
+        val o = origin
+        if (o != null) {
+            val p: Float = progress.value
+            val dx: Float = kotlin.math.max(o.x, size.width - o.x)
+            val dy: Float = kotlin.math.max(o.y, size.height - o.y)
+            val maxR: Float = kotlin.math.sqrt(dx * dx + dy * dy)
+            val a: Float = (0.18f * (1f - p)).coerceIn(0f, 1f)
+            drawCircle(
+                color = Color.Black.copy(alpha = a),
+                radius = maxR * p,
+                center = o
+            )
+        }
+    }
+}
+
+/**
+ * ★开关胶囊圆点★：移动过程中横向拉长成胶囊，到达终点恢复圆形，带轻微弹簧回弹。
+ * 轨道只套一层边框，圆角用连续曲率；强调色只用 UiColor.Accent 一种。
+ */
+@Composable
+fun CapsuleSwitch(
+    checked: Boolean,
+    onChanged: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+    trackW: Dp = 46.dp,
+    trackH: Dp = 26.dp,
+    dot: Dp = 20.dp,
+    pad: Dp = UiSpace.xs
+) {
+    val src = remember { MutableInteractionSource() }
+    val p by animateFloatAsState(
+        targetValue = if (checked) 1f else 0f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessLow
+        ),
+        label = "capsuleSwitch"
+    )
+    // 全程用 Dp 运算，不引入 density / px，也不依赖 Dp.div(Float) 这类版本相关运算符
+    val travel: Dp = trackW - dot - pad - pad
+    val xDp: Dp = pad + travel * p.coerceIn(0f, 1f)
+    // 两端为圆（stretch=1），行程中点最扁（胶囊）
+    val k: Float = (1f - 2f * abs(p - 0.5f)).coerceIn(0f, 1f)
+    val stretch: Float = 1f + 1.6f * k
+    Box(
+        modifier = modifier
+            .size(trackW, trackH)
+            .clip(CircleShape)
+            .background(if (checked) UiColor.Accent else UiColor.SurfaceHi)
+            .border(1.dp, UiColor.Line, CircleShape)
+            .touchRipple(src)
+            .clickable(interactionSource = src, indication = null) { onChanged(!checked) },
+        contentAlignment = Alignment.CenterStart
+    ) {
+        Box(
+            modifier = Modifier
+                .offset(x = xDp)
+                .size(width = (dot.value * stretch).dp, height = dot)
+                .clip(CircleShape)
+                // 白底黑字主题：轨道是浅灰/橙，圆点改成近黑才看得见
+                .background(UiColor.Ink)
+        )
+    }
+}
+
+/**
+ * ★真正的调色盘★：预览不再「叠一层半透明色」，而是对画面本身做乘性 RGB 增益。
+ *
+ * 与成片后处理 postProcessPhoto、调色盘盘面共用同一个 toneGains()，
+ * 中性点（warmth=0 / tint=0 / intensity=0）得到恒等矩阵 —— 拖到正中间
+ * 画面完全不变，不会再雾蒙蒙。
+ */
+fun toneColorMatrix(warmth: Float, tint: Float, intensity: Float): ColorMatrix {
+    val g = toneGains(warmth, tint, intensity)
+    return ColorMatrix(
+        floatArrayOf(
+            g[0], 0f, 0f, 0f, 0f,
+            0f, g[1], 0f, 0f, 0f,
+            0f, 0f, g[2], 0f, 0f,
+            0f, 0f, 0f, 1f, 0f
+        )
+    )
+}
+
+// ╚══════════════════ 补丁块结束 ═══════════════════╝
 
 // ==================== 设备兼容层 ====================
 
@@ -467,12 +1068,35 @@ object DeviceCompatibility {
                         model.contains("iqqo 10 pro") || model.contains("iqqo10pro")
                 )
 
+    /**
+     * ★vivo X100 系列（含用户所写的「X1000s」，按 X100s / X1000s 号段归档）★
+     * 这批机器的潜望长焦对第三方 App 只回逻辑头的数码裁切，必须物理直连。
+     */
+    val isVivoX100Series: Boolean
+        get() = isVivo && (
+                model.contains("x1000s") || model.contains("x100s") ||
+                        model.contains("x100 pro") || model.contains("x100 ultra") ||
+                        device.startsWith("v2309") || device.startsWith("v2324") ||
+                        device.startsWith("v2338") || device.startsWith("v2366")
+                )
+
+    /**
+     * ★一加 Ace 6T★：Ace 系列里少数带长焦的档位，同样只肯用主摄做数码裁切。
+     */
+    val isOnePlusAce6T: Boolean
+        get() = isOnePlus && (
+                model.contains("ace 6t") || model.contains("ace6t") ||
+                        device.contains("ace6t") || model.contains("ace 6")
+                )
+
     /** 已确认"逻辑头不切长焦、长焦必须物理直连"的机型 */
     val isKnownTeleStubborn: Boolean
         get() = (ActiveDevice.profile?.teleStubborn == true) ||
                 isRealmeGT5Pro || isIQOO10Pro || isVivoX80Pro || isIQOO15Series ||
                 isOppoFindSeries || isOnePlusTeleStubborn || isHuaweiPSeries ||
-                isXiaomiTeleStubborn
+                isXiaomiTeleStubborn ||
+                // ★本次新增★：这两台即使没选机型档案也强制走物理长焦直连
+                isVivoX100Series || isOnePlusAce6T
 
     /**
      * 小米 10 系列。DEVICE（内部代号）：小米10=umi、10 Pro=cmi、10 至尊版=cas、10S=thyme。
@@ -1976,6 +2600,16 @@ object SeriesDb {
         ),
 
         // ───────────────────────── vivo ─────────────────────────
+        // ★vivo X1000s / X100s★：带潜望长焦，第三方必须物理直连
+        profile(
+            BrandKey.VIVO, "vivo_x100s", "vivo X100s / X1000s",
+            "X100 系列衍生档，潜望长焦在第三方里只回主摄裁切，已按顽固机型处理",
+            listOf(0.6f, 1f, 2f, 4.3f, 10f), 30f,
+            tele = true, strategy = LensSwitchStrategy.PHYSICAL_FIRST, settle = 300L,
+            tint = listOf(1.02f, 0.99f, 0.98f),
+            hints = listOf("x1000s", "x100s", "v2309", "v2324", "v2338", "v2366"),
+            notes = "真实光学档位 0.6 / 1 / 4.3；2x 是主摄裁切"
+        ),
         profile(
             BrandKey.VIVO, "vivo_x", "vivo X 系列",
             "蔡司影像旗舰（X80 / X90 / X100 / X200 / X300）。潜望长焦在第三方里切不动，要直连",
@@ -2070,6 +2704,16 @@ object SeriesDb {
         ),
 
         // ───────────────────────── 一加 ─────────────────────────
+        // ★一加 Ace 6T★：Ace 系列里带长焦的档位，单独建档（不影响其它 Ace）
+        profile(
+            BrandKey.ONEPLUS, "op_ace6t", "一加 Ace 6T",
+            "带长焦的 Ace 档位，逻辑头只给主摄裁切，长焦必须物理直连",
+            listOf(0.6f, 1f, 2f, 3f), 20f,
+            tele = true, strategy = LensSwitchStrategy.PHYSICAL_FIRST, settle = 300L,
+            tint = listOf(1.00f, 1.00f, 1.01f),
+            hints = listOf("ace 6t", "ace6t"),
+            notes = "与不带长焦的普通 Ace 分开归档，避免落到只有 0.6/1/2 的旧档"
+        ),
         profile(
             BrandKey.ONEPLUS, "op_num", "一加数字系列",
             "一加 11 / 12 / 13 / 15。与 OPPO 同宗 HAL，长焦在第三方里常年切不动，必须直连",
@@ -2409,7 +3053,11 @@ object LensScanCache {
      * 取 12 次：一次切镜头复用一次，正常拍摄很难连点 12 次，
      * 而真陈旧时最多卡 12 次操作就被纠正。
      */
-    private const val REUSE_LIMIT = 12
+    /** 复用 4 次 / 存活 45s 后强制重扫：相机服务重启后旧 id 会失效 */
+    private const val REUSE_LIMIT = 4
+    private const val MAX_AGE_MS = 45_000L
+    @Volatile private var putAtMs = 0L
+    @Volatile private var bindFailStreak = 0
 
     @Volatile
     var facing: Int? = null
@@ -2441,6 +3089,10 @@ object LensScanCache {
             Log.d("Camera", "镜头扫描缓存已复用 $reuseCount 次，本次强制重扫")
             return false
         }
+        if (System.currentTimeMillis() - putAtMs > MAX_AGE_MS) {
+            Log.d("Camera", "镜头扫描缓存已超时，本次强制重扫")
+            return false
+        }
         return true
     }
 
@@ -2466,6 +3118,8 @@ object LensScanCache {
         this.lenses = lenses
         this.physical = physical
         reuseCount = 0
+        putAtMs = System.currentTimeMillis()
+        bindFailStreak = 0
         return true
     }
 
@@ -2487,13 +3141,35 @@ object LensScanCache {
         lenses = null
         physical = null
         reuseCount = 0
+        putAtMs = 0L
+        bindFailStreak = 0
     }
+
+    /**
+     * 连续 2 次绑定/出流失败 → 判定缓存不可信，作废全部镜头缓存并强制重扫。
+     * 单次失败可能是临时占用，不清；这样既避免误伤，也避免坏 id 无限循环重绑。
+     */
+    fun noteBindFailure(reason: String) {
+        bindFailStreak++
+        Log.w("Camera", "镜头绑定失败（$reason），连续第 $bindFailStreak 次")
+        if (bindFailStreak >= 2) {
+            markInvalid("连续绑定失败 $bindFailStreak 次")
+            try { DeviceCompatibility.clearProbeCache() }
+            catch (e: Exception) { Log.w("Camera", "清理探测缓存失败（不影响重扫）", e) }
+            bindFailStreak = 0
+            Log.w("Camera", "缓存自愈：已作废全部镜头/物理头/厂商焦段缓存")
+        }
+    }
+
+    fun noteBindSuccess() { bindFailStreak = 0 }
 
     fun clear() {
         facing = null
         lenses = null
         physical = null
         reuseCount = 0
+        putAtMs = 0L
+        bindFailStreak = 0
     }
 }
 
@@ -2521,31 +3197,31 @@ fun BrandSeriesPickerDialog(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color(0xF20D0D0D))
+                .background(UiColor.Scrim)
                 .padding(horizontal = 20.dp, vertical = 24.dp),
             contentAlignment = Alignment.Center
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(24.dp))
-                    .background(Color(0xFF171719))
-                    .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(24.dp))
+                    .clip(RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
+                    .background(UiColor.Surface)
+                    .border(1.dp, UiColor.Border, RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
                     .padding(20.dp)
                     .verticalScroll(rememberScrollState())
             ) {
                 Text(
                     text = if (step == 0) "选择你的手机品牌" else "选择系列",
-                    color = Color.White,
+                    color = UiColor.Ink,
                     fontSize = 20.sp,
                     fontWeight = FontWeight.Bold
                 )
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = if (step == 0)
                         "Silky Camera 会按品牌加载对应的多摄适配策略"
                     else "${brand.cn} · 选一个最接近你机器的系列",
-                    color = Color.White.copy(alpha = 0.55f),
+                    color = UiColor.TextDim,
                     fontSize = 13.sp
                 )
                 if (step == 1 && fromDetected && detected != null && detected.brand == brand) {
@@ -2570,15 +3246,15 @@ fun BrandSeriesPickerDialog(
                             Box(
                                 modifier = Modifier
                                     .height(52.dp)
-                                    .clip(RoundedCornerShape(12.dp))
+                                    .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
                                     .background(
                                         if (sel) Color(0xFFFFA000).copy(alpha = 0.22f)
-                                        else Color.White.copy(alpha = 0.06f)
+                                        else UiColor.Wash
                                     )
                                     .border(
                                         1.dp,
                                         if (sel) Color(0xFFFFA000) else Color.Transparent,
-                                        RoundedCornerShape(12.dp)
+                                        RoundedCornerShape(MENU_RADIUS_INNER_DP.dp)
                                     )
                                     .clickable {
                                         brand = b
@@ -2589,7 +3265,7 @@ fun BrandSeriesPickerDialog(
                             ) {
                                 Text(
                                     text = b.cn,
-                                    color = if (sel) Color(0xFFFFA000) else Color.White,
+                                    color = if (sel) Color(0xFFFFA000) else UiColor.Ink,
                                     fontSize = 13.sp,
                                     fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
                                     textAlign = TextAlign.Center
@@ -2604,32 +3280,32 @@ fun BrandSeriesPickerDialog(
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
+                                    .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
                                     .background(
                                         if (sel) Color(0xFFFFA000).copy(alpha = 0.18f)
-                                        else Color.White.copy(alpha = 0.05f)
+                                        else UiColor.Wash
                                     )
                                     .border(
                                         1.dp,
                                         if (sel) Color(0xFFFFA000) else Color.Transparent,
-                                        RoundedCornerShape(12.dp)
+                                        RoundedCornerShape(MENU_RADIUS_INNER_DP.dp)
                                     )
                                     .clickable {
                                         picked = s
                                         fromDetected = false
                                     }
-                                    .padding(horizontal = 14.dp, vertical = 10.dp)
+                                    .padding(horizontal = MENU_EDGE_DP.dp, vertical = 10.dp)
                             ) {
                                 Text(
                                     text = s.name,
-                                    color = if (sel) Color(0xFFFFA000) else Color.White,
+                                    color = if (sel) Color(0xFFFFA000) else UiColor.Ink,
                                     fontSize = 14.sp,
                                     fontWeight = FontWeight.Medium
                                 )
-                                Spacer(modifier = Modifier.height(3.dp))
+                                Spacer(modifier = Modifier.height(4.dp))
                                 Text(
                                     text = s.summary,
-                                    color = Color.White.copy(alpha = 0.5f),
+                                    color = UiColor.TextDim,
                                     fontSize = 11.sp,
                                     lineHeight = 15.sp
                                 )
@@ -2647,8 +3323,8 @@ fun BrandSeriesPickerDialog(
                         modifier = Modifier
                             .weight(1f)
                             .height(44.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(Color.White.copy(alpha = 0.08f))
+                            .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                            .background(UiColor.Wash)
                             .clickable {
                                 if (step == 0) onSkip() else step = 0
                             },
@@ -2656,7 +3332,7 @@ fun BrandSeriesPickerDialog(
                     ) {
                         Text(
                             text = if (step == 0) "跳过（通用模式）" else "上一步",
-                            color = Color.White.copy(alpha = 0.7f),
+                            color = UiColor.TextDim,
                             fontSize = 14.sp
                         )
                     }
@@ -2664,10 +3340,10 @@ fun BrandSeriesPickerDialog(
                         modifier = Modifier
                             .weight(1f)
                             .height(44.dp)
-                            .clip(RoundedCornerShape(12.dp))
+                            .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
                             .background(
                                 if (picked != null) Color(0xFFFFA000)
-                                else Color.White.copy(alpha = 0.08f)
+                                else UiColor.Wash
                             )
                             .clickable {
                                 if (step == 0) {
@@ -2680,7 +3356,7 @@ fun BrandSeriesPickerDialog(
                     ) {
                         Text(
                             text = if (step == 0) "下一步" else "确定",
-                            color = if (picked != null) Color.Black else Color.White.copy(alpha = 0.4f),
+                            color = if (picked != null) UiColor.Ink else UiColor.TextDim,
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -2719,7 +3395,7 @@ fun DeviceTuningDialog(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color(0xF20D0D0D))
+                .background(UiColor.Scrim)
                 .padding(horizontal = 20.dp, vertical = 24.dp),
             contentAlignment = Alignment.Center
         ) {
@@ -2730,15 +3406,15 @@ fun DeviceTuningDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(Color(0xFF171719))
-                        .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(24.dp))
+                        .clip(RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
+                        .background(UiColor.Surface)
+                        .border(1.dp, UiColor.Border, RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
                         .padding(20.dp)
                         .verticalScroll(rememberScrollState())
                 ) {
                     Text(
                         text = "机型与色彩",
-                        color = Color.White,
+                        color = UiColor.Ink,
                         fontSize = 20.sp,
                         fontWeight = FontWeight.Bold
                     )
@@ -2749,15 +3425,15 @@ fun DeviceTuningDialog(
                         fontSize = 13.sp
                     )
                     current?.let {
-                        Spacer(modifier = Modifier.height(6.dp))
+                        Spacer(modifier = Modifier.height(8.dp))
                         Text(
                             text = "策略：${it.strategy.label}　光学档位：${it.opticalStops.joinToString(" / ") { s -> "${s}x" }}　可用上限：${it.maxUsefulZoom.toInt()}x",
-                            color = Color.White.copy(alpha = 0.5f),
+                            color = UiColor.TextDim,
                             fontSize = 11.sp
                         )
                         Text(
                             text = it.notes,
-                            color = Color.White.copy(alpha = 0.5f),
+                            color = UiColor.TextDim,
                             fontSize = 11.sp,
                             lineHeight = 15.sp
                         )
@@ -2789,7 +3465,7 @@ fun DeviceTuningDialog(
                         text = if (colorUnify) {
                             LensColorUnifier.statusLine(curKey)
                         } else "统一镜头色彩已关闭",
-                        color = Color.White.copy(alpha = 0.45f),
+                        color = UiColor.TextDim,
                         fontSize = 11.sp,
                         lineHeight = 15.sp
                     )
@@ -2816,15 +3492,15 @@ fun DeviceTuningDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(48.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(Color(0xFF171719))
-                        .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(14.dp))
+                        .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                        .background(UiColor.SurfaceHi)
+                        .border(1.dp, UiColor.Border, RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
                         .clickable { onClose() },
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("关闭", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                    Text("关闭", color = UiColor.Ink, fontSize = 15.sp, fontWeight = FontWeight.Medium)
                 }
-                Spacer(modifier = Modifier.height(40.dp))
+                Spacer(modifier = Modifier.height(32.dp))
             }
         }
     }
@@ -2836,14 +3512,14 @@ private fun TuningRow(title: String, sub: String, onClick: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 6.dp)
-            .clip(RoundedCornerShape(12.dp))
-            .background(Color.White.copy(alpha = 0.05f))
+            .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+            .background(UiColor.Wash)
             .clickable { onClick() }
-            .padding(horizontal = 14.dp, vertical = 12.dp)
+            .padding(horizontal = MENU_EDGE_DP.dp, vertical = 12.dp)
     ) {
-        Text(text = title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-        Spacer(modifier = Modifier.height(3.dp))
-        Text(text = sub, color = Color.White.copy(alpha = 0.45f), fontSize = 11.sp)
+        Text(text = title, color = UiColor.Ink, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(text = sub, color = UiColor.TextDim, fontSize = 11.sp)
     }
 }
 
@@ -2858,33 +3534,18 @@ private fun TuningSwitch(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 6.dp)
-            .clip(RoundedCornerShape(12.dp))
-            .background(Color.White.copy(alpha = 0.05f))
+            .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+            .background(UiColor.Wash)
             .clickable { onChanged(!checked) }
-            .padding(horizontal = 14.dp, vertical = 12.dp),
+            .padding(horizontal = MENU_EDGE_DP.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f)) {
-            Text(text = title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            Spacer(modifier = Modifier.height(3.dp))
-            Text(text = sub, color = Color.White.copy(alpha = 0.45f), fontSize = 11.sp, lineHeight = 15.sp)
+            Text(text = title, color = UiColor.Ink, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(text = sub, color = UiColor.TextDim, fontSize = 11.sp, lineHeight = 15.sp)
         }
-        Box(
-            modifier = Modifier
-                .size(width = 46.dp, height = 26.dp)
-                .clip(CircleShape)
-                .background(if (checked) Color(0xFFFFA000) else Color.White.copy(alpha = 0.18f))
-                .clickable { onChanged(!checked) },
-            contentAlignment = if (checked) Alignment.CenterEnd else Alignment.CenterStart
-        ) {
-            Box(
-                modifier = Modifier
-                    .padding(horizontal = 3.dp)
-                    .size(20.dp)
-                    .clip(CircleShape)
-                    .background(Color.White)
-            )
-        }
+        CapsuleSwitch(checked = checked, onChanged = onChanged)
     }
 }
 
@@ -4181,16 +4842,16 @@ fun StarTrailBar(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(Color.White.copy(alpha = 0.07f))
+            .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+            .background(UiColor.Wash)
             .clickable { if (!running) onOpenSetup() }
-            .padding(horizontal = 14.dp, vertical = 10.dp),
+            .padding(horizontal = MENU_EDGE_DP.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
         Text(
             text = "🌌 星轨　${cfg.exposureSec}s × ${cfg.frames}张　ISO ${cfg.iso}",
-            color = Color.White,
+            color = UiColor.Ink,
             fontSize = 13.sp,
             fontWeight = FontWeight.Medium
         )
@@ -4217,7 +4878,7 @@ fun StarTrailSetupDialog(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color(0xF20D0D0D))
+                .background(UiColor.Scrim)
                 .padding(horizontal = 18.dp, vertical = 22.dp),
             contentAlignment = Alignment.Center
         ) {
@@ -4228,22 +4889,22 @@ fun StarTrailSetupDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(Color(0xFF171719))
-                        .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(24.dp))
+                        .clip(RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
+                        .background(UiColor.Surface)
+                        .border(1.dp, UiColor.Border, RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
                         .padding(18.dp)
                         .verticalScroll(rememberScrollState())
                 ) {
                     Text(
                         "星轨参数",
-                        color = Color.White,
+                        color = UiColor.Ink,
                         fontSize = 19.sp,
                         fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                         "建议：上三脚架、对准北极星附近、曝光越长轨迹越长",
-                        color = Color.White.copy(alpha = 0.5f),
+                        color = UiColor.TextDim,
                         fontSize = 11.sp
                     )
                     Spacer(modifier = Modifier.height(12.dp))
@@ -4274,7 +4935,7 @@ fun StarTrailSetupDialog(
                     StarToggle("对焦锁定无穷远", c.focusInfinity) { c = c.copy(focusInfinity = it) }
                     StarToggle("关闭机内降噪 / 锐化", c.rawPipeline) { c = c.copy(rawPipeline = it) }
 
-                    Spacer(modifier = Modifier.height(14.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
                     val totalSec =
                         (c.exposureSec * c.frames + c.frames * c.intervalMs / 1000f).roundToInt()
                     Text(
@@ -4291,15 +4952,15 @@ fun StarTrailSetupDialog(
                         modifier = Modifier
                             .weight(1f)
                             .height(48.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(Color(0xFF171719))
-                            .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(14.dp))
+                            .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                            .background(UiColor.SurfaceHi)
+                            .border(1.dp, UiColor.Border, RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
                             .clickable { onClose() },
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
                             "取消",
-                            color = Color.White,
+                            color = UiColor.Ink,
                             fontSize = 15.sp,
                             fontWeight = FontWeight.Medium
                         )
@@ -4308,7 +4969,7 @@ fun StarTrailSetupDialog(
                         modifier = Modifier
                             .weight(1f)
                             .height(48.dp)
-                            .clip(RoundedCornerShape(14.dp))
+                            .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
                             .background(Color(0xFFFFA000))
                             .clickable { onChange(c); onClose() },
                         contentAlignment = Alignment.Center
@@ -4321,7 +4982,7 @@ fun StarTrailSetupDialog(
                         )
                     }
                 }
-                Spacer(modifier = Modifier.height(40.dp))
+                Spacer(modifier = Modifier.height(32.dp))
             }
         }
     }
@@ -4342,7 +5003,7 @@ private fun StarSlider(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Text(title, color = Color.White, fontSize = 13.sp)
+            Text(title, color = UiColor.Ink, fontSize = 13.sp)
             Text(
                 text = if (format.contains("d")) {
                     String.format(format, value.roundToInt())
@@ -4369,28 +5030,19 @@ private fun StarToggle(title: String, checked: Boolean, onChanged: (Boolean) -> 
             .fillMaxWidth()
             .padding(vertical = 5.dp)
             .clip(RoundedCornerShape(10.dp))
-            .background(Color.White.copy(alpha = 0.05f))
+            .background(UiColor.Wash)
             .clickable { onChanged(!checked) }
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(title, color = Color.White, fontSize = 13.sp, modifier = Modifier.weight(1f))
-        Box(
-            modifier = Modifier
-                .size(width = 44.dp, height = 24.dp)
-                .clip(CircleShape)
-                .background(if (checked) Color(0xFFFFA000) else Color.White.copy(alpha = 0.18f))
-                .clickable { onChanged(!checked) },
-            contentAlignment = if (checked) Alignment.CenterEnd else Alignment.CenterStart
-        ) {
-            Box(
-                modifier = Modifier
-                    .padding(horizontal = 3.dp)
-                    .size(18.dp)
-                    .clip(CircleShape)
-                    .background(Color.White)
-            )
-        }
+        Text(title, color = UiColor.Ink, fontSize = 13.sp, modifier = Modifier.weight(1f))
+        CapsuleSwitch(
+            checked = checked,
+            onChanged = onChanged,
+            trackW = 44.dp,
+            trackH = 24.dp,
+            dot = 18.dp
+        )
     }
 }
 
@@ -4421,21 +5073,21 @@ fun StarTrailProgressOverlay(
                         .clip(RoundedCornerShape(16.dp)),
                     contentScale = ContentScale.FillWidth
                 )
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(12.dp))
             }
             Text(
                 text = "堆栈中 $done / $total",
-                color = Color.White,
+                color = UiColor.Ink,
                 fontSize = 17.sp,
                 fontWeight = FontWeight.Bold
             )
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(8.dp))
             Box(
                 modifier = Modifier
                     .fillMaxWidth(0.82f)
                     .height(6.dp)
                     .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.15f))
+                    .background(Color.Black.copy(alpha = 0.15f))
             ) {
                 Box(
                     modifier = Modifier
@@ -4447,12 +5099,12 @@ fun StarTrailProgressOverlay(
             Spacer(modifier = Modifier.height(18.dp))
             Box(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(Color.White.copy(alpha = 0.12f))
+                    .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                    .background(UiColor.Wash)
                     .clickable { onStop() }
                     .padding(horizontal = 26.dp, vertical = 10.dp)
             ) {
-                Text("停止并合成", color = Color.White, fontSize = 14.sp)
+                Text("停止并合成", color = UiColor.Ink, fontSize = 14.sp)
             }
         }
     }
@@ -4471,28 +5123,28 @@ fun StarTrailResultDialog(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color(0xF20D0D0D))
+                .background(UiColor.Scrim)
                 .padding(horizontal = 24.dp),
             contentAlignment = Alignment.Center
         ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(24.dp))
-                    .background(Color(0xFF171719))
-                    .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(24.dp))
+                    .clip(RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
+                    .background(UiColor.Surface)
+                    .border(1.dp, UiColor.Border, RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
                     .padding(20.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text("🌌 星轨完成", color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                Spacer(modifier = Modifier.height(10.dp))
+                Text("🌌 星轨完成", color = UiColor.Ink, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = "堆栈 ${result.frames} 张 · 耗时 ${result.costMs / 1000}s" +
                             if (result.stopped) "（已提前停止）" else "",
-                    color = Color.White.copy(alpha = 0.55f),
+                    color = UiColor.TextDim,
                     fontSize = 12.sp
                 )
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(12.dp))
                 Text(
                     text = buildString {
                         if (result.jpegUri != null) appendLine("✅ 星轨合成图（JPEG）")
@@ -4511,11 +5163,11 @@ fun StarTrailResultDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(44.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color.White.copy(alpha = 0.1f))
+                        .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                        .background(UiColor.Wash)
                         .clickable { onClose() },
                     contentAlignment = Alignment.Center
-                ) { Text("好", color = Color.White, fontSize = 14.sp) }
+                ) { Text("好", color = UiColor.Ink, fontSize = 14.sp) }
             }
         }
     }
@@ -4742,6 +5394,13 @@ object LensColorUnifier {
         b: CaptureRequestOptions.Builder,
         key: String,
         /**
+         * ★重负载录制（4K/60）中不写色彩校正矩阵★
+         * 每次重设 COLOR_CORRECTION_MODE / GAINS 都会让 HAL 重算 CCM，
+         * 增益重算的一瞬间 R/B 通道会跳 → 录下来就是「彩色闪屏」。
+         * 录制首包已经锁定过一次色彩，之后不再动它。
+         */
+        suppressColorGains: Boolean = false,
+        /**
          * ★强制锁白平衡★（录制过程中传 true）
          *
          * 这是「录出来的视频一阵一阵偏色、像花屏」的直接解法。
@@ -4784,7 +5443,7 @@ object LensColorUnifier {
             }
 
             // 可选：把校准出的增益直接下给 HAL（默认关，见 manualGain 的说明）
-            if (manualGain && measured.containsKey(key)) {
+            if (manualGain && !suppressColorGains && measured.containsKey(key)) {
                 val g = gainFor(key)
                 b.setCaptureRequestOption(
                     CaptureRequest.COLOR_CORRECTION_MODE,
@@ -4898,17 +5557,23 @@ private fun Modifier.bouncyPress(
     selectedScale: Float = 1f
 ): Modifier {
     val isPressed by interactionSource.collectIsPressedAsState()
+    // ★所有调用点传进来的 0.88 / 0.90 / 0.92 / 0.97 一律收敛到 96%★
+    // 只在函数内部 clamp，调用点一行都不用改。
+    val p96: Float = 0.96f
     val target = when {
         !enabled -> 1f
-        isPressed -> pressed
+        isPressed -> p96
         selected -> selectedScale
         else -> 1f
     }
+    // 单一 spring 调用（不用 if/else 两种 AnimationSpec 求公共超类型）：
+    // 按下 NoBouncy 快速收到 96%，松手 MediumBouncy 先过冲到略超 100% 再回 100%。
     val scaleValue by animateFloatAsState(
         targetValue = target,
         animationSpec = spring(
-            dampingRatio = Spring.DampingRatioMediumBouncy,
-            stiffness = Spring.StiffnessMedium
+            dampingRatio = if (isPressed) Spring.DampingRatioNoBouncy
+            else Spring.DampingRatioMediumBouncy,
+            stiffness = if (isPressed) Spring.StiffnessHigh else Spring.StiffnessMedium
         ),
         label = "bouncyPress"
     )
@@ -4939,7 +5604,9 @@ fun TopChip(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     corner: Dp = TOP_CHIP_CORNER,
-    compact: Boolean = false
+    compact: Boolean = false,
+    /** ★菜单栏入口★：同一套中性色里更亮一档，明显但不突兀、不引入彩色 */
+    emphasized: Boolean = false
 ) {
     val shape = RoundedCornerShape(corner)
     // 紧凑模式：左右内边距 10→6dp、上下 6→3dp、字号 12→10sp
@@ -4948,20 +5615,26 @@ fun TopChip(
     val padV: Dp = if (compact) TOP_CHIP_PAD_V_COMPACT else 6.dp
     val fs = if (compact) TOP_CHIP_FONT_COMPACT else 12.sp
 
-    // ★交互动画★：按下缩小到 0.90、松手弹回；底色也从常态色平滑过渡
+    // ★统一配色★：所有顶部按钮共用同一套中性色，靠明暗区分状态，不再有橙色块。
+    // 原来 0.4 黑底 + 0.25 白边在亮画面下几乎看不见，就是「和背景融为一体」的根因。
     val interactionSource = remember { MutableInteractionSource() }
-    val bgColor = rememberPressColor(
-        interactionSource = interactionSource,
-        normal = if (selected) Color(0xFFFFA000) else Color.Black.copy(alpha = 0.4f),
-        pressedColor = if (selected) Color(0xFFFFB300) else Color.White.copy(alpha = 0.18f)
-    )
+    val hi = selected || emphasized
+    //
+    // ★★按键文字不再带底板★★
+    // 直接浮在取景画面上：白字 + 淡灰竖线「|」分隔，按压反馈交给
+    // bouncyPress（缩到 90%）和 touchRipple（触点波纹），不再画背景色块。
+    // 选中 / 菜单入口靠亮一档白字区分，不引入第二种颜色。
+    //
+    val textColor: Color = if (hi) UiColor.PreviewText else UiColor.PreviewTextDim
 
     Box(
         modifier = modifier
             .bouncyPress(interactionSource, pressed = 0.90f)
             .clip(shape)
-            .background(bgColor)
-            .border(1.dp, Color.White.copy(alpha = 0.25f), shape)
+            // ★参数状态栏按键：既不画底板、也不画单体边框★
+            // .clip 只用来把波纹裁进圆角范围，不参与绘制底色。
+            // 面板级边框（菜单 / 闪光面板 / 调色盘…）仍保留。
+            .touchRipple(interactionSource)
             .clickable(
                 interactionSource = interactionSource,
                 indication = null
@@ -4971,12 +5644,13 @@ fun TopChip(
     ) {
         Text(
             text = text,
-            color = if (selected) Color.Black else Color.White,
+            color = textColor,
             fontSize = fs,
             fontWeight = FontWeight.Bold,
             maxLines = 1,
-            // ★只旋转文字★：界面没跟着屏幕转时，把文字单独转正
-            modifier = Modifier.rotate(LocalLabelRotation.current)
+            // ★按长度决定是否旋转★：界面没跟着屏幕转时，短文案单独转正；
+            // 超过 4 个字符的长文案保持原样（见 rotatedLabel 的 text 判断）。
+            modifier = Modifier.rotatedLabel(text)
         )
     }
 }
@@ -5082,12 +5756,13 @@ private fun RecordingTimecode(seconds: Long) {
             modifier = Modifier
                 .size(7.dp)
                 .clip(CircleShape)
+                // 红底上的白点：功能性状态色，白底黑字主题的合理例外
                 .background(Color.White.copy(alpha = blink))
         )
         Spacer(modifier = Modifier.width(7.dp))
         Text(
             text = text,
-            color = Color.White,
+            color = Color.White,   // 红底上用白字（功能性状态色例外）
             fontSize = 14.sp,
             fontWeight = FontWeight.Bold,
             // 等宽：数字跳动时不会左右挪动（"11:11" 和 "88:88" 一样宽）
@@ -5111,7 +5786,7 @@ private fun CompositionGuides(
     /**
      * ★水平仪是否显示★（默认跟 visible 一致）
      *
-     * 传 false 的场景：【镜头朝地面】时。
+     * 传 false 的场景：【镜头朝地面】时（俯角 ≥ [LEVEL_HIDE_PITCH_DEG]，默认 45°）。
      *   俯拍地面时画面里根本没有地平线，"左右端平"毫无意义 ——
      *   水平仪只会变成一条跟着手机乱转的线干扰构图。
      *   此时三分线仍然有用（构图参照跟拍什么无关），所以只隐藏水平仪。
@@ -5257,7 +5932,7 @@ private fun CompositionGuides(
                 val rs = kotlin.math.sin(rr).toFloat()
                 val rh = half * 0.62f
                 drawLine(
-                    color = Color.White.copy(alpha = 0.22f),
+                    color = Color.Black.copy(alpha = 0.22f),
                     start = Offset(cx - rh * rc, cy - rh * rs),
                     end = Offset(cx + rh * rc, cy + rh * rs),
                     strokeWidth = 1.dp.toPx()
@@ -5297,6 +5972,24 @@ private const val REC_AE_LOCK_EXEMPT_FOR_HEAVY = true
 private const val LEVEL_TOLERANCE_DEG = 1.5f
 
 /**
+ * ★★水平仪自动隐藏的【俯角阈值】★★
+ *
+ * 镜头朝下俯角 ≥ 45° 时认为在拍地面 / 桌面，画面里没有地平线，
+ * 只隐藏水平仪、三分线保留；俯角回落到 45° − 回差 以下时恢复。
+ *
+ * 静止时加速度计 az = g·sin(俯角)：
+ *   竖直持机（镜头平拍前方）az≈0   → 0°
+ *   平放屏幕朝上（镜头垂直朝下）az≈+g → 90°
+ * 以前写死 0.5g / 0.3g（≈30° / ≈17°），正常手持看屏幕稍微低头就会误隐藏；
+ * 现在用 asin 反算真实角度，**改判定角度只改这一个数**。
+ */
+private const val LEVEL_HIDE_PITCH_DEG = 45f
+/** 解除隐藏的回差（度）：45° 隐藏、≤42° 恢复，防临界点反复闪烁 */
+private const val LEVEL_HIDE_PITCH_HYST_DEG = 3f
+/** 标准重力，用于把加速度计读数换算成俯角 */
+private const val LEVEL_GRAVITY = 9.8f
+
+/**
  * 地平线在【屏幕坐标系】里的角度（度）：0=竖屏端平，±90=横屏端平，180=倒置端平。
  *
  * 用 atan2(-ax, ay) 而不是常见的 roll = atan2(ax, √(ay²+az²))：
@@ -5325,11 +6018,11 @@ private fun rememberDeviceTilt(context: Context, lowPower: Boolean): Pair<Float,
     //       az ≈ +g（+9.8）→ 屏幕【朝上】→ 镜头朝【地面】  ← 俯拍
     //       az ≈ 0         → 手机竖直 → 平拍前方
     //       az ≈ -g（-9.8）→ 屏幕朝下 → 镜头朝【天空】      ← 仰拍
-    //     所以判据是 az > +0.35g，不是 az < -0.35g。
+    //     所以判据是 az > 0（俯角为正），不是 az < 0。
     //
     //   ⚠️ 用【原始值 az】而不是滤波后的 fz：滤波会让 az 在翻腕瞬间滞后，
-    //      判断慢半拍。另外加了回差（开 > 0.5g / 关 < 0.3g），
-    //      避免在临界角附近反复横跳导致水平仪闪烁。
+    //      判断慢半拍。判定改成按真实俯角（见下面 LEVEL_HIDE_PITCH_DEG），
+    //      并留 3° 回差，避免在临界角附近反复横跳导致水平仪闪烁。
     //
     var facingGround by remember { mutableStateOf(false) }
     //
@@ -5397,16 +6090,20 @@ private fun rememberDeviceTilt(context: Context, lowPower: Boolean): Pair<Float,
                 // 变化太小就不写 State —— 不写 = 不重组 = 不重绘
                 if (abs(newDeg - horizonDeg) >= eps) horizonDeg = newDeg
                 //
-                // 镜头朝地面判定（带回差，防临界抖动）：
-                //   az < -0.35g → 判定朝地面；az > -0.15g → 解除
+                // ★★镜头朝地面判定：按【真实俯角】判定，阈值 45°★★
+                //   静止时 az = g·sin(俯角) → 俯角 = asin(az / g)
+                //   俯角 ≥ 45°               → 隐藏水平仪
+                //   俯角 ≤ 45° − 3° = 42°    → 恢复（回差防闪烁）
+                //   仰拍 / 平拍（az ≤ 0，俯角为负或 0）一律不隐藏。
                 //
-                //
-                // 阈值取 0.5g（俯角 ≈30°）/ 0.3g（≈17°）：
-                //   0.35g（≈20°）偏敏感，正常手持看屏幕时轻微低头就可能误隐藏；
-                //   真正"拍地面/桌面"的俯角一般都在 45° 以上，0.5g 足够覆盖。
-                //
-                if (az > 0.5f * 9.8f) facingGround = true
-                else if (az < 0.3f * 9.8f) facingGround = false
+                val pitchDeg: Float = Math.toDegrees(
+                    asin((az / LEVEL_GRAVITY).coerceIn(-1f, 1f).toDouble())
+                ).toFloat()
+                if (pitchDeg >= LEVEL_HIDE_PITCH_DEG) {
+                    facingGround = true
+                } else if (pitchDeg <= LEVEL_HIDE_PITCH_DEG - LEVEL_HIDE_PITCH_HYST_DEG) {
+                    facingGround = false
+                }
             }
             override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
         }
@@ -5695,7 +6392,7 @@ private data class SettingsBarState(
     val photoRatio: PhotoRatio,
     val flashMode: Int,
     val autoRotate: Boolean,
-    /** 调色盘是否有色偏（用于在设置栏上点亮入口） */
+    /** 调色盘是否有色偏（用于在设置栏上点亮入口；录像模式无入口） */
     val toneActive: Boolean = false
 )
 
@@ -5712,6 +6409,8 @@ private data class SettingsBarActions(
     val onStabilizationChange: (StabMode) -> Unit,
     val onPhotoRatioChange: (PhotoRatio) -> Unit,
     val onFlashExpand: () -> Unit,
+    /** ★点录像画质按钮 → 整条参数栏从左往右展开成画质选择条★（不再直接循环切下一档） */
+    val onQualityExpand: () -> Unit = {},
     val onAbout: () -> Unit,
     /** 打开苹果风格调色盘 */
     val onColorPalette: () -> Unit = {},
@@ -5725,8 +6424,8 @@ private data class SettingsBarActions(
  * 以前按键是写死在 [SettingsChipItems] 里的一串 TopChip，装不下就只能被挤出屏幕
  * （录像模式那排尤其明显）。现在每个按键都描述成一份数据：
  *   · 装得下 → 画成 chip
- *   · 装不下 → 按 [menuEntries] 展开成菜单里的若干项
- * 菜单按键 [CHIP_MENU] 永远保留，不参与溢出。
+ *   · 装不下 / [menuOnly] → 按 [menuEntries] 展开成菜单里的若干项
+ * 菜单按键 [CHIP_MENU] 永远保留、永远排在参数栏最右（竖排时最下），不参与溢出。
  */
 private data class ChipSpec(
     val id: String,
@@ -5735,7 +6434,14 @@ private data class ChipSpec(
     val selected: Boolean = false,
     val onClick: () -> Unit = {},
     /** 溢出后在菜单里展开成的项 */
-    val menuEntries: List<MenuEntry> = emptyList()
+    val menuEntries: List<MenuEntry> = emptyList(),
+    /**
+     * ★只进菜单、绝不在参数栏上画 chip★
+     * 用于「功能要保留，但不想占参数栏位置」的按键。
+     * 它会被 computeHiddenChips 无条件收进 overflow，
+     * SettingsChipItems 也不会为它画边框占位。
+     */
+    val menuOnly: Boolean = false
 )
 
 /** 菜单里的一项（文字 / 是否选中 / 点击动作） */
@@ -5792,8 +6498,9 @@ private fun buildChipSpecs(
             label = st.videoQuality.label,
             onClick = {
                 act.onHaptic()
-                val vals = VideoQuality.values()
-                act.onVideoQualityChange(vals[(vals.indexOf(st.videoQuality) + 1) % vals.size])
+                // ★整条录制参数栏从左往右展开成画质选择条★（缓慢、占满整条）。
+                // 菜单溢出项仍保留直选（values() 现在只有 1080P / 4K 两项）。
+                act.onQualityExpand()
             },
             menuEntries = VideoQuality.values().map { q ->
                 MenuEntry("画质 ${q.label}", st.videoQuality == q) { act.onVideoQualityChange(q) }
@@ -5832,6 +6539,14 @@ private fun buildChipSpecs(
                 MenuEntry(m.label, st.stabMode == m) { act.onStabilizationChange(m) }
             }
         )
+        //
+        // ★★4K60 菜单里那两项「主摄 / 长焦」录制镜头按键已按需求取消★★
+        //
+        // 不再提供任何开录前的镜头预选入口。4K60 录制期间该用哪颗镜头，
+        // 完全由 VideoRecordEvent.Start 按【开录瞬间的实际画面】判定
+        // （≥5x → 长焦/中长焦 5~15x，其余 → 主摄 1~6x），录制中不跨镜头、
+        // 不重绑、不闪色 —— 那段逻辑一行都没动。
+        //
     }
 
     // ── 拍摄比例：3:4 / 16:9 / 全屏 ──
@@ -5855,18 +6570,28 @@ private fun buildChipSpecs(
     // 现在界面方向恒由 LOCK_UI_PORTRAIT 决定（锁定竖屏），autoRotate 保留为内部状态但不再有入口，
     // 文字转正走的是另一套：labelRotationDeg / LocalLabelRotation（未改动，见下方注释）。
 
-    out += ChipSpec(
-        id = CHIP_TONE,
-        label = "调色",
-        selected = st.toneActive,
-        onClick = {
-            act.onHaptic()
-            act.onColorPalette()
-        },
-        menuEntries = listOf(
-            MenuEntry("调色盘", st.toneActive) { act.onColorPalette() }
+    //
+    // ★★录像模式彻底不出现调色盘★★
+    //
+    // 参数栏不画「调色」chip、溢出菜单也不补「调色盘」项（MultiLevelMenu
+    // 里那个兜底项一并删掉）。调色本来只作用于成片 JPEG（postProcessPhoto），
+    // 录像流并不经过它，所以这里只是收掉入口，不触碰任何拍摄 / 录制逻辑，
+    // 也不影响拍照 / 专业 / 星空模式的调色功能。
+    //
+    if (st.mode != CaptureMode.VIDEO) {
+        out += ChipSpec(
+            id = CHIP_TONE,
+            label = "调色",
+            selected = st.toneActive,
+            onClick = {
+                act.onHaptic()
+                act.onColorPalette()
+            },
+            menuEntries = listOf(
+                MenuEntry("调色盘", st.toneActive) { act.onColorPalette() }
+            )
         )
-    )
+    }
 
     // ── 多级菜单入口：永不溢出 ──
     out += ChipSpec(
@@ -5879,10 +6604,20 @@ private fun buildChipSpecs(
     )
 
     // ── 闪光灯：图标按钮 ──
+    //
+    // ★★4K 录制规格（VIDEO + UHD，含 4K30 / 4K60）：图标移进「菜单」按键★★
+    // menuOnly = true → 参数栏不画这颗圆钮，但 menuEntries 会稳定出现在
+    // 菜单根页（overflow 的「闪光灯」条目），点它照样 onFlashExpand() 打开
+    // 闪光面板；同时 MultiLevelMenu 会在点完关掉菜单，不会叠层。
+    // 其它画质（1080P）和所有非录像模式：图标照常留在参数栏上。
+    //
+    val flashInMenu: Boolean =
+        st.mode == CaptureMode.VIDEO && st.videoQuality == VideoQuality.UHD
     out += ChipSpec(
         id = CHIP_FLASH,
         label = "闪光",
         selected = st.flashMode == 3,
+        menuOnly = flashInMenu,
         onClick = {
             act.onHaptic()
             act.onFlashExpand()
@@ -5891,7 +6626,15 @@ private fun buildChipSpecs(
             MenuEntry("闪光灯") { act.onFlashExpand() }
         )
     )
-    return out
+    //
+    // ★★自适应：菜单键永远排在最右 / 最下★★
+    //
+    // sortedBy 是稳定排序，所以除菜单键外的相对顺序一点不变，只把 CHIP_MENU
+    // 挪到末尾。这一处改了，四个消费者（横排参数栏、竖排参数栏、两处菜单
+    // overflow）拿到的都是同一份顺序，以后再加新按键也不会把菜单键挤到中间。
+    // 配合 computeHiddenChips 的「一次性截断」，参数栏永远是「连续前 N 项 + 菜单」。
+    //
+    return out.sortedBy { if (it.id == CHIP_MENU) 1 else 0 }
 }
 
 /**
@@ -5918,8 +6661,15 @@ private fun estimateChipMain(label: String, compact: Boolean): Dp {
 }
 
 /**
- * ★溢出判定★：按 [specs] 的顺序累加尺寸，超出 [available] 的挪进菜单。
- * 菜单键 [CHIP_MENU] 强制保留（否则整个菜单入口都没了），其余按先后顺序溢出。
+ * ★溢出判定★：按 [specs] 的顺序累加尺寸，超出 [available] 的全部挪进菜单。
+ *
+ * 三条规则（对应「菜单键永远在最右，多余的按键全部放进菜单按键里面」）：
+ *  ① 菜单键 [CHIP_MENU] 强制保留，且由 buildChipSpecs 排到列表末尾 ——
+ *     无论横排还是竖排，它都是参数栏最后一个（横排最右 / 竖排最下）。
+ *  ② [ChipSpec.menuOnly] 的按键无条件进菜单，不占参数栏任何宽度。
+ *  ③ 一旦某个按键装不下，【它和之后的所有按键】一起进菜单（一次性截断），
+ *     而不是「第 3 个收走、第 5 个还留着」那种参差的排布。
+ *     这样参数栏永远是「前 N 个连续按键 + 菜单」，视觉和菜单项顺序都整齐。
  */
 private fun computeHiddenChips(
     specs: List<ChipSpec>,
@@ -5927,19 +6677,35 @@ private fun computeHiddenChips(
     gap: Dp,
     compact: Boolean
 ): Set<String> {
-    if (available <= 0.dp) return emptySet()
+    val menuOnlyIds: Set<String> = specs.filter { it.menuOnly }.map { it.id }.toSet()
+    // 可用尺寸还没测出来时也要把 menuOnly 收进菜单，避免它临时漏到参数栏上
+    if (available <= 0.dp) return menuOnlyIds
+
     val hidden = mutableSetOf<String>()
-    // 先给菜单键留位置
+    hidden.addAll(menuOnlyIds)
+    // 先给末尾的菜单键留位置（最后一个按键与它之间还有 1 个 gap，
+    // 下面每轮累加都会带一个 gap，正好对得上）
     var used = estimateChipMain("菜单", compact)
+    var overflowing = false
     for (spec in specs) {
         if (spec.id == CHIP_MENU) continue
+        if (spec.menuOnly) continue
+        if (overflowing) {
+            hidden.add(spec.id)
+            continue
+        }
         val need = when {
             // 闪光是圆形图标，尺寸固定
             spec.id == CHIP_FLASH -> if (compact) TOP_CHIP_ICON_COMPACT else 36.dp
             else -> estimateChipMain(spec.label, compact)
         }
         val next = used + gap + need
-        if (next <= available) used = next else hidden.add(spec.id)
+        if (next <= available) {
+            used = next
+        } else {
+            overflowing = true
+            hidden.add(spec.id)
+        }
     }
     return hidden.toSet()
 }
@@ -5947,18 +6713,94 @@ private fun computeHiddenChips(
 /**
  * 设置栏按键的实际渲染。
  *
- * ★自动适配★：装不下的按键（菜单键除外）由 [computeHiddenChips] 判定后不再画 chip，
+ * ★自动适配★：装不下的按键、以及 [ChipSpec.menuOnly] 的按键都不再画 chip，
  * 而是按 [ChipSpec.menuEntries] 在菜单里出现，所以功能一个都不会丢，只是换了入口。
  */
+/**
+ * ★★统一柔光玻璃材质★★（参考 haze / LiquidGlass 的视觉配方）
+ *
+ * 所有「拍摄预览界面上的菜单 / 面板」共用这一个 Modifier，材质才可能一致：
+ *   · ① 明度混合层 AcrylicDim（极淡暗色，托住黑字）
+ *   · ② TintColor 层：尺寸分级 TintOpacity —— 小按键 0.24 / 面板 0.30 /
+ *     强调 0.48，等价于开源项目的分级 blur
+ *   · ③ 单层【亮边】GlassEdge（亚克力靠边缘光学勾轮廓）
+ *   · 同心圆角：外 16 / 内 10
+ *   · 顶部一条 1dp 纯色 specular rim，内缩到 MENU_EDGE_DP，
+ *     与内容左边缘对齐；纯色实线，不渐变、不发光、不加阴影
+ *
+ * 刻意不用 Modifier.blur / RenderEffect / saveLayer：预览是 SurfaceView，
+ * 任何离屏层都会破坏 Compose 打的透明洞（历史全黑 bug）。
+ * 三层都是普通 draw call，Compose 仍会在宿主 canvas 上正常打洞。
+ */
+private fun Modifier.softGlass(
+    cornerDp: Int = MENU_RADIUS_OUTER_DP,
+    emphasized: Boolean = false
+): Modifier {
+    val shape: Shape = RoundedCornerShape(cornerDp.dp)
+    return this
+        .clip(shape)
+        // ① 明度混合层：Fluent 的 TintLuminosityOpacity / haze 的 dimming layer
+        .background(UiColor.AcrylicDim)
+        // ② TintColor：透明亚克力主体，背景从这里透出来
+        .background(if (emphasized) UiColor.GlassHi else UiColor.GlassPanel)
+        // ③ 只套一层亮边
+        .border(1.dp, UiColor.GlassEdge, shape)
+        .drawWithContent {
+            drawContent()
+            // specular rim 画在内容之上、顶边内侧；不占布局高度
+            val inset = MENU_EDGE_DP.dp.toPx()
+            if (size.width > inset * 2f) {
+                val y = 1.dp.toPx()
+                drawLine(
+                    color = UiColor.GlassRim,
+                    start = Offset(inset, y),
+                    end = Offset(size.width - inset, y),
+                    strokeWidth = 1.dp.toPx()
+                )
+            }
+        }
+}
+
+/**
+ * ★参数栏按键之间的分隔符：一条连续的淡灰色竖线「|」★
+ *
+ * 用户明确：是竖线 |，不是虚线、也不是省略号。
+ * 上一轮画成了点状虚线，看起来像省略号，已纠正。
+ * 横排 / 竖排都画同一条细竖线（vertical 参数保留是为了两个调用点不用改），
+ * 不用表情符号 / 装饰徽章 / 渐变 / 发光 / 彩色阴影。
+ */
+@Suppress("UNUSED_PARAMETER")
+@Composable
+private fun ParamBarDivider(vertical: Boolean) {
+    val color: Color = UiColor.ParamDivider
+    Canvas(modifier = Modifier.width(1.dp).height(18.dp)) {
+        drawLine(
+            color = color,
+            start = Offset(size.width / 2f, 0f),
+            end = Offset(size.width / 2f, size.height),
+            strokeWidth = 1.dp.toPx()
+        )
+    }
+}
+
 @Composable
 private fun SettingsChipItems(
     specs: List<ChipSpec>,
     st: SettingsBarState,
     act: SettingsBarActions,
     compact: Boolean = false,
-    hidden: Set<String> = emptySet()
+    hidden: Set<String> = emptySet(),
+    /** true = 横屏竖排参数栏（画水平虚线），false = 竖屏横排（画竖直虚线） */
+    vertical: Boolean = false
 ) {
-    specs.forEach { spec ->
+    // 只在【两个都可见】的按键之间画分隔线；被 overflow 收走的按键不占位。
+    var hasVisible = false
+    specs.forEachIndexed { _, spec ->
+        val visible: Boolean = !spec.menuOnly &&
+                (spec.id == CHIP_MENU || spec.id !in hidden)
+        if (!visible) return@forEachIndexed
+        if (hasVisible) ParamBarDivider(vertical = vertical)
+        hasVisible = true
         when {
             // ★菜单键永远保留★：它是所有溢出项的唯一入口，不能被溢出掉
             spec.id == CHIP_MENU -> {
@@ -5966,11 +6808,14 @@ private fun SettingsChipItems(
                     text = spec.label,
                     selected = false,
                     onClick = spec.onClick,
-                    compact = compact
+                    compact = compact,
+                    // ★菜单栏入口★：比其它按钮亮一档，一眼能找到，
+                    // 但仍是同一套中性色，不会变成一颗彩色按钮破坏平衡
+                    emphasized = true
                 )
             }
             spec.id == CHIP_FLASH -> {
-                if (spec.id in hidden) return@forEach
+                if (spec.id in hidden) return@forEachIndexed
                 // ★交互动画★：与 TopChip 同一套按压反馈
                 val flashSource = remember { MutableInteractionSource() }
                 Box(
@@ -5978,11 +6823,9 @@ private fun SettingsChipItems(
                         .bouncyPress(flashSource, pressed = 0.88f)
                         .size(if (compact) TOP_CHIP_ICON_COMPACT else 36.dp)
                         .clip(CircleShape)
-                        .background(
-                            if (st.flashMode == 3) Color(0xFFFFC107).copy(alpha = 0.9f)
-                            else Color.Black.copy(alpha = 0.4f)
-                        )
-                        .border(1.dp, Color.White.copy(alpha = 0.25f), CircleShape)
+                        // ★与参数栏 chip 一致：不画底板、不画单体边框★
+                        // 白色闪电图标直接浮在画面上，靠 bouncyPress + 触点波纹反馈。
+                        .touchRipple(flashSource)
                         .clickable(
                             interactionSource = flashSource,
                             indication = null
@@ -5992,11 +6835,11 @@ private fun SettingsChipItems(
                         },
                     contentAlignment = Alignment.Center
                 ) {
-                    FlashIcon(mode = st.flashMode)
+                    FlashIcon(mode = st.flashMode, white = true)
                 }
             }
             else -> {
-                if (spec.id in hidden) return@forEach
+                if (spec.id in hidden) return@forEachIndexed
                 TopChip(
                     text = spec.label,
                     selected = spec.selected,
@@ -6009,6 +6852,35 @@ private fun SettingsChipItems(
     // ★关于已移入"菜单 → 关于"★：设置栏上不再常驻"?"按钮
 }
 
+/**
+ * ★参数栏翻转的【瞬态】伴随变换★
+ *
+ * 文字转正是主体（rotatedLabel 全程连续 rotate），整条栏只在翻转
+ * 【过程中】轻轻跟一下，端点必须完全静止：
+ *
+ *   · 0° / ±90° / ±180°（竖屏、横屏、倒置静止）→ rotationZ = 0、scale = 1
+ *   · 45° 附近（翻转中途）→ 最多 1.35° 倾斜 + 缩到 97.5%
+ *
+ * phase = sin(spin · π/90) 天然满足：0、±90、±180 处取 0，±45 处取 ±1。
+ * 旧实现直接 rotationZ = spin × 0.015f，导致横屏静止时整条栏永久歪 1.35°、
+ * 倒置时歪 2.7°，这就是用户反馈的「水平状态下翻转屏幕参数栏倾斜」。
+ *
+ * 用 graphicsLayer 而不是 Modifier.rotate：绘制层变换不参与测量，
+ * 不会改变参数栏占的布局空间，横屏那套紧凑间距完全不受影响。
+ * 任何模式都生效（SettingsChipsRow / SettingsChipsColumn 共用这一份）。
+ */
+@Composable
+private fun Modifier.spinWithUi(): Modifier {
+    val spin: Float = LocalLabelRotation.current
+    return this.graphicsLayer {
+        val phase: Float = sin(spin * (Math.PI.toFloat() / 90f))
+        rotationZ = phase * UI_SPIN_FOLLOW_DEG
+        val k: Float = abs(phase)
+        scaleX = 1f - k * UI_SPIN_SCALE_DROP
+        scaleY = scaleX
+    }
+}
+
 /** 竖屏：参数栏横着排在顶部 */
 @Composable
 private fun SettingsChipsRow(
@@ -6019,7 +6891,7 @@ private fun SettingsChipsRow(
     onHiddenChange: (Set<String>) -> Unit = {}
 ) {
     val specs = buildChipSpecs(st, act)
-    BoxWithConstraints(modifier = modifier) {
+    BoxWithConstraints(modifier = modifier.spinWithUi()) {
         // 用真实可用宽度判定：装不下的按键交给菜单
         val shouldHide = computeHiddenChips(specs, maxWidth, TOP_BAR_GAP_PORTRAIT, false)
         LaunchedEffect(shouldHide) { onHiddenChange(shouldHide) }
@@ -6027,7 +6899,9 @@ private fun SettingsChipsRow(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(TOP_BAR_GAP_PORTRAIT)
         ) {
-            SettingsChipItems(specs, st, act, compact = false, hidden = hidden)
+            SettingsChipItems(
+                specs, st, act, compact = false, hidden = hidden, vertical = false
+            )
         }
     }
 }
@@ -6042,7 +6916,7 @@ private fun SettingsChipsColumn(
     onHiddenChange: (Set<String>) -> Unit = {}
 ) {
     val specs = buildChipSpecs(st, act)
-    BoxWithConstraints(modifier = modifier) {
+    BoxWithConstraints(modifier = modifier.spinWithUi()) {
         // 竖排：可用高度就是这一栏的最大高度，间隔 6.dp
         val gap = 6.dp
         val shouldHide = computeHiddenChips(specs, maxHeight, gap, true)
@@ -6051,7 +6925,9 @@ private fun SettingsChipsColumn(
             verticalArrangement = Arrangement.spacedBy(gap),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            SettingsChipItems(specs, st, act, compact = true, hidden = hidden)
+            SettingsChipItems(
+                specs, st, act, compact = true, hidden = hidden, vertical = true
+            )
         }
     }
 }
@@ -6064,12 +6940,17 @@ private fun SettingsChipsColumn(
 fun FlashIcon(
     mode: Int,
     modifier: Modifier = Modifier,
-    selected: Boolean = false
+    selected: Boolean = false,
+    /** ★参数栏透明底：图标改白★（其它调用点保持默认，不受影响） */
+    white: Boolean = false
 ) {
     val mainColor = when {
-        selected -> Color(0xFFFFC107)
-        mode == 0 -> Color.White.copy(alpha = 0.55f)
-        else -> Color.White
+        white -> if (mode == 0) Color.White.copy(alpha = 0.55f) else Color.White
+        // ★统一颜色★：图标也用同一套中性灰阶，选中靠容器底色/描边的明暗区分，
+        // 不再单独冒出一处橙色（强调色只在菜单选中项这一处保留）
+        selected -> UiColor.Text
+        mode == 0 -> UiColor.TextDim
+        else -> UiColor.Text
     }
     Canvas(modifier = modifier.size(22.dp)) {
         val w = size.width
@@ -6141,9 +7022,16 @@ enum class PhotoRatio(val label: String, val aspect: Int?) {
     FULL("全屏", null)
 }
 
-/** 录像画质档位。CameraX 的 Quality 会按机型自动挑对应的分辨率 */
+/**
+ * 录像画质档位。CameraX 的 Quality 会按机型自动挑对应的分辨率。
+ * ★只保留 1080P 与 4K 两档★ —— 点顶部「画质」按钮会弹出选择面板，
+ * 溢出菜单里也只有这两项（menuEntries 直接由 values() 生成，自动跟随）。
+ *
+ * 旧版本存过 "HD" 的 SharedPreferences 不用迁移：读取处是
+ * runCatching { VideoQuality.valueOf(...) }.getOrDefault(VideoQuality.FHD)，
+ * valueOf 抛异常会被吞掉并回落到 1080P。
+ */
 enum class VideoQuality(val label: String, val quality: Quality) {
-    HD("720P", Quality.HD),
     FHD("1080P", Quality.FHD),
     UHD("4K", Quality.UHD)
 }
@@ -6152,7 +7040,7 @@ enum class VideoQuality(val label: String, val quality: Quality) {
  * 录像码率：以 1080p30 = 24Mbps 为锚点，其余档位按像素/秒等比缩放。
  * 4K 额外乘 0.72 效率折扣（分辨率越高压缩效率越高，线性给会浪费且撑爆编码器）。
  *
- * 720p30=11M  720p60=21M  1080p30=24M  1080p60=48M  4K30=69M  4K60=138M（夹前值）
+ * 1080p30=24M  1080p60=48M  4K30=69M  4K60=138M（夹前值）
  *
  * ⚠️ 末尾 coerceIn(2M, CAP) 是【全局】生效的，所以 4K 两档实际都夹到 60M。
  *    60M 是硬上限：之前「4K60 花屏」就是编码器过载吐坏帧，给满必然复发。
@@ -6164,7 +7052,6 @@ private const val VIDEO_BITRATE_CAP_4K60 = 60_000_000     // 4K60 硬上限（�
 private fun pixelFactor(q: VideoQuality): Float = when (q) {
     VideoQuality.UHD -> (3840f * 2160f) / (1920f * 1080f)   // 4.0
     VideoQuality.FHD -> 1f
-    VideoQuality.HD -> (1280f * 720f) / (1920f * 1080f)     // 0.444
 }
 
 private fun videoBitrateFor(q: VideoQuality, fps: VideoFrameRate): Int {
@@ -7074,6 +7961,20 @@ private const val MAX_PHOTO_ZOOM = 50.0f
  */
 private const val MAX_VIDEO_ZOOM = 15.0f
 
+/**
+ * ★★4K60 录制镜头锁定区间★★
+ * 用户要求：4K 60 帧时要么只录主摄、要么只录长焦/中长焦，录制中不跨镜头。
+ *   · 主摄          1x  ~ [ZOOM_4K60_MAIN_MAX]
+ *   · 长焦 / 中长焦  该长焦原生倍率 ~ [ZOOM_4K60_TELE_MAX]
+ * 20x 超过录像常规 15x 上限的部分仍走已有的「扩展数码变焦」(boostTarget +
+ * clampForHal)，不需要改相机参数包，也不会增加 4K60 的 HAL 负担。
+ */
+private const val ZOOM_4K60_MAIN_MAX = 6f
+/** ★长焦 / 中长焦区间起点：固定 5x（不再按机型探测最小光学档）★ */
+private const val ZOOM_4K60_TELE_MIN = 5f
+/** ★长焦 / 中长焦区间终点：15x★（原 20f） */
+private const val ZOOM_4K60_TELE_MAX = 15f
+
 /** 预览 / 拍照时的目标帧率。锁成 30-30 让 AE 不再拖帧，预览更稳、也减少拖影噪点 */
 private const val DEFAULT_PREVIEW_FPS = 30
 
@@ -7087,52 +7988,110 @@ private const val FRAME_OVERHEAD_NS = 1_000_000L
 private const val MAX_USEFUL_STOP = 20f
 
 /**
- * 点变焦档位按钮（切换焦段）时的动画时长基准(ms)。
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║  ★★变焦曲线族：参考主流设计系统，全部集中在这里切换★★          ║
+ * ╚══════════════════════════════════════════════════════════════╝
  *
- * 手感目标：前段冲得快、后段明显慢下来收尾。
- * 上一版收到 280~420ms 实测偏快，中间过程一晃就过去，看不出"减速"的那一段。
- * 现在放宽到 460~680ms，让尾段的减速过程看得见，又不至于拖沓。
- * 大幅度的变焦（跨好几档）用短时长，小幅度的用长时长，避免"拉到底等半天"。
- */
-private const val ZOOM_ANIM_BASE_MS = 720f
-/**
- * 每跨 1 倍变焦范围「节省」的时长(ms)。
- * ★这个值越小，大幅度变焦就越慢★
- * 以前 160f 会让"从 0.6x 拉到 10x"被压到下限，跨得越远反而越赶。
- * 现在降到 25f：大幅变焦几乎吃满 BASE(720ms)，小幅变焦也在 690~720ms 附近，
- * 整体节奏更接近"大幅度慢慢推、小幅度轻轻点"。
- * 还想再慢就把它调成 0f（所有幅度统一吃满 BASE）。
- */
-private const val ZOOM_ANIM_SPAN_FACTOR = 25f
-private const val ZOOM_ANIM_MIN_MS = 520f
-
-/**
- * ★变焦曲线：先快、后段明显慢下来★
- * cubic-bezier(0.22, 0.86, 0.08, 1)
- *   · P1 = (0.22, 0.86)：x 很小而 y 很大 → 起步几乎立刻冲出去（前两成时间走掉大半路程）
- *   · P2 = (0.08, 1)：   y 顶到 1 → 后段收得很平，形成长长的减速尾巴
- * 这样"先快后慢"的对比很明显，跟 iPhone 切焦段的手感一致。
+ * 参数语义（Compose 官方）：CubicBezierEasing(a, b, c, d) =
+ *   (x1, y1, x2, y2)。曲线以 fraction 作 x 求 y；两个 x 控制点都落在 0..1
+ *   内才能保证 x(t) 单调、求根稳定，否则 transform() 会抛
+ *   IllegalArgumentException。下面四条都满足这个约束。
  *
- * 对比一下之前的几条：
- *   (0.55, 0.1, 0.3, 1) 起步有个"蓄力"过程，点档位会觉得相机顿一下才动；
- *   (0.32, 0.72, 0, 1)  起步好了，但尾段收敛过长、整体显得急躁 —— 就是"曲线太快"的来源。
+ * ── 出处与取向 ──
+ *  · LEGACY      = FastOutSlowInEasing = cubic-bezier(0.4, 0, 0.2, 1)
+ *                  Compose / Android 官方标准曲线，也是你最初 .txt 里实际生效的那条。
+ *                  先加速后减速，两端都留了缓冲 —— 稳，但起步偏「温」。
+ *                  ★本版已按用户要求还原为这一条★
+ *  · M3_DECEL    = cubic-bezier(0.05, 0.7, 0.1, 1)
+ *                  Material 3 Emphasized Decelerate（元素入场/落位）。
+ *                  前 20% 时间走掉约 80% 距离，最「脆」，但对相机变焦太猛：
+ *                  HAL 每 16ms 下发一次，crop 骤变会撞上防抖重算，容易顿。
+ *  · IOS_NATIVE  = cubic-bezier(0.2, 0.9, 0.3, 1)
+ *                  iOS 系统动效逆向参数，典型耗时 320~450ms。
+ *                  起步快但不猛冲、无过冲、尾段柔和收住；
+ *                  a=0.2 < c=0.3 保证 x 单调，数值上最稳。
+ *                  变焦是「连续物理量」而不是入场动画，这条比 M3 那条更合适。
+ *  · EXPO_OUT    = cubic-bezier(0.16, 1, 0.3, 1)
+ *                  Apple HIG / Linear 常用的 out-expo，280ms 级默认曲线。
+ *                  比 IOS_NATIVE 更利落，想更「一点即到位」就换它。
+ *  · LEGACY_APPLE= cubic-bezier(0.22, 0.86, 0.08, 1)  ← ★默认★
+ *                  ★这就是你最先发来的 .txt 里那条【变焦曲线代码】★
+ *                  private val APPLE_EASE = CubicBezierEasing(0.22f, 0.86f, 0.08f, 1f)
+ *                  （原文档 7120 行）。注释标「先快、后段明显慢下来 / 跟 iPhone 切焦段手感一致」。
+ *                  起步几乎立刻冲出去（P1 x=0.22 y=0.86），后段长长的减速尾巴（P2 y=1）。
+ *
+ * 想换曲线：只改下面 SYMMETRIC_ZOOM_EASE 的右值，一行搞定。
+ * 时长与曲线无关，三个数独立可调。
  */
-private val APPLE_EASE = CubicBezierEasing(0.22f, 0.86f, 0.08f, 1f)
+private val ZOOM_EASE_LEGACY: Easing = FastOutSlowInEasing
+private val ZOOM_EASE_M3_DECEL: Easing = CubicBezierEasing(0.05f, 0.7f, 0.1f, 1f)
+private val ZOOM_EASE_IOS: Easing = CubicBezierEasing(0.2f, 0.9f, 0.3f, 1f)
+private val ZOOM_EASE_EXPO_OUT: Easing = CubicBezierEasing(0.16f, 1f, 0.3f, 1f)
+private val ZOOM_EASE_LEGACY_APPLE: Easing = CubicBezierEasing(0.22f, 0.86f, 0.08f, 1f)
 
 /**
- * 对称变焦曲线：放大和缩小的速度手感必须一致。
- * 老实现两处不对称：① APPLE_EASE 是"起步猛冲+长尾"的非对称曲线，反向用完全变形
- * ② 线性插值 r = a+(b-a)*t 让人眼觉得缩小前段飞快、后段拖沓（感知的是比例不是差值）。
- * 现在：缓动换 FastOutSlowInEasing（近似对称），插值改到对数域
- * r = exp(lerp(ln a, ln b, t)) —— 每秒变化的倍率比例恒定，a/b 对调后曲线完全镜像。
+ * ★当前生效的变焦曲线★：就是你最先发来的 .txt 里那条代码
+ *     private val APPLE_EASE = CubicBezierEasing(0.22f, 0.86f, 0.08f, 1f)
+ * 即 cubic-bezier(0.22, 0.86, 0.08, 1)：起步猛冲、后段长尾减速。
+ *
+ * ⚠️ 关于原文档注释里「APPLE_EASE 非对称，反向用完全变形」那句：
+ *    那是针对【老的线性域插值 r = a+(b-a)*t + 给反向做 1-ease(1-t) 镜像】说的。
+ *    当前实现是【同一条 ease + 对数域插值 r = exp(lerp(ln a, ln b, eased))】，
+ *    放大/缩小只是 (lnEnd - lnStart) 变号，用同一条曲线、时间分布完全一致，
+ *    不做反向镜像 —— 所以换回这条非对称曲线，双向手感依然一致，不会变形。
+ *    x 控制点 0.22 / 0.08 均在 0..1 内且 x(t) 单调，CubicBezierEasing 求根稳定。
+ *
+ * 速率仍是上一轮已还原的 720 / 520 / 120 / 25，本轮未动。
+ * 注：翻转动画（labelRotationAnim）用独立的 ZOOM_EASE_IOS / 420ms，
+ * 是之前单独加的功能，不跟随变焦曲线，本轮不动。
+ *
+ * 曲线族其余四条仍留在上面，想换只改本行右值，一行搞定。
  */
-private val SYMMETRIC_ZOOM_EASE = FastOutSlowInEasing
+private val SYMMETRIC_ZOOM_EASE: Easing = ZOOM_EASE_LEGACY_APPLE
 
 /**
- * 对数域的跨度系数：每跨 ln 倍（约 2.718x）省下的时长(ms)。
+ * 点变焦档位按钮（切换焦段）的动画时长基准(ms)。
+ * ★整体调慢★：从原文档的 720f 提到 900f（+25%）。
+ * 手感目标不变：前段冲得快、后段明显慢下来收尾，只是全程更从容一点。
+ * 大幅度的变焦（跨好几档）用短时长，小幅度的用长时长，避免「拉到底等半天」。
+ * 想再慢 / 再快只改这一个数（连同下面的 ZOOM_ANIM_MIN_MS 一起按比例调）。
+ */
+private const val ZOOM_ANIM_BASE_MS = 900f
+
+/**
+ * 每跨 ln 倍（约 2.718x）省下的时长(ms)。
  * 时长只跟【倍率跨度】有关，不跟方向有关 —— 这也是对称的一部分。
+ * ★已还原为你最初 .txt 文档里的原值 120f★（原文档 7135 行）。
  */
 private const val ZOOM_ANIM_SPAN_FACTOR_LOG = 120f
+
+/** 时长下限：0.6→10x 这种大跨度会落到这里。★随基准一起调慢：520f → 650f★ */
+private const val ZOOM_ANIM_MIN_MS = 650f
+
+/** 旧版线性域跨度系数（保留兼容，动画循环已改用对数域版本） */
+private const val ZOOM_ANIM_SPAN_FACTOR = 25f
+
+/**
+ * ★★短焦段减速 + 短→长共用同一曲线★★
+ *
+ * 之前所有变焦共用一条 easing，但时长只按倍率跨度算，短焦段（0.6~2x）
+ * 起步那段被 (0.22,0.86,0.08,1) 的猛冲曲线带得特别快；
+ * 而跨到长焦时又要重新算时长，手感像"换了一条曲线"。
+ *
+ * 现在用一个【连续权重】统一处理，全程同一 easing + 同一公式：
+ *   shortWeight = (SHORT_MAX - min(start,end)) / (SHORT_MAX - SHORT_MIN)
+ *   duration    = 基准时长 × (1 + (SLOWDOWN-1) × shortWeight)
+ *
+ *   · 两端都在短焦（0.6→1）→ weight=1 → 最慢（需求②）
+ *   · 从短焦到长焦（1→10）→ weight≈0.71 → 自然过渡（需求③：不断层、不换曲线）
+ *   · 两端都在长焦（5→10）→ weight=0 → 原速率
+ * 权重是 min(两端) 的线性函数，没有阈值跳变，放大/缩小也完全对称。
+ * 想更慢调 SLOWDOWN，想改「短焦」的范围调 MIN/MAX 两个数。
+ */
+private const val ZOOM_SHORT_FOCAL_MIN = 0.6f
+private const val ZOOM_SHORT_FOCAL_MAX = 2.0f
+private const val ZOOM_SHORT_FOCAL_SLOWDOWN = 1.35f
+
 
 /**
  * 变焦卡顿的真正元凶是【Compose 重组】，不是 HAL。
@@ -7194,6 +8153,25 @@ private const val VIDEO_AWB_LOCK_DELAY_MS_4K60 = 1200L
 private const val ZOOM_UI_REFRESH_MS_REC = 120L
 
 /**
+ * ★★从超高倍率大跨度回缩（如 20x → 5x）的专用节流★★
+ *
+ * OPPO / ColorOS 上这一下最卡：起点在【扩展数码变焦区】（预览缩放 8x 量级），
+ * 目标回落到中长焦档。原来仍按待机的 16ms 步长给 HAL 下发、每 72ms
+ * 提交一次 displayedRatio（= 整棵 CameraApp 重组），还容易顺手触发一次
+ * 预防性物理头直连（unbind+bind，几百毫秒黑遮罩）。三者叠起来就是"一顿"。
+ *
+ * 通用机 24ms / OPPO 系 32ms：crop region 变化本来就不需要 60fps，
+ * 回缩段放宽一半，HAL 状态机调用与编码器争抢都减下来。
+ * UI 提交 96ms：倍率数字 ~10fps 足够，重组次数再降 1/4。
+ *
+ * 只影响"起点在 HAL 上限之外 + 目标不到起点 60%"的回缩；
+ * 正常变焦、拉伸、录制中、广角回缩全部走原常量，行为不变。
+ */
+private const val ZOOM_ANIM_STEP_MS_RETRACE = 24L
+private const val ZOOM_ANIM_STEP_MS_RETRACE_OPPO = 32L
+private const val ZOOM_UI_REFRESH_MS_RETRACE = 96L
+
+/**
  * 拖动变焦的下发节流间隔(ms)。
  * detectTransformGestures 是按【指针事件】回调的，一秒能来 100+ 次，
  * 每个事件都 setZoomRatio 一次，防抖开着时等于每秒重建 100 次稳定窗口——必卡。
@@ -7210,8 +8188,11 @@ private const val DRAG_ZOOM_THROTTLE_REC_MS = 150L
  *    否则"已是最新版"的判断会反过来，每次启动都提示更新（见 AboutScreen 里的说明）。
  * 发新版时改这两处，并且【记得同步 app/build.gradle 里的 versionName / versionCode】。
  */
-private const val APP_VERSION_NAME = "v3.2.7"
-private const val APP_VERSION_CODE = 11
+private const val APP_VERSION_NAME = "v3.2.8"
+/** ★发版递增★：11→12。协议钥匙 = versionCode:POLICY_REVISION，
+ *  只有它变了，覆盖安装后才会像新版本一样重新弹用户协议；
+ *  更新检测也以 gradle 的 versionCode 为准，务必同步 app/build.gradle(.kts)。 */
+private const val APP_VERSION_CODE = 12
 
 /**
  * ★应用显示名★
@@ -7353,84 +8334,125 @@ fun UpdateDialog(
         onDismissRequest = { if (!info.force) onDismiss() },
         properties = DialogProperties(dismissOnBackPress = !info.force, dismissOnClickOutside = !info.force)
     ) {
+        //
+        // ★★更新内容长时可滑动，按钮永远钉在下面★★
+        //
+        // 三段式：固定标题 → 可滚动的更新内容（weight）→ 固定底部按钮。
+        // 外层 heightIn(max=520.dp) 给 weight 一个有界高度，长 changelog
+        // 只会把中间那段撑到上限后在内部滚，标题和「前往安装」都不跟着跑。
+        // weight(1f, fill=false) 让内容短时弹窗不凭空长高。
+        //
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(20.dp))
-                .background(Color(0xFF1C1C1E))
-                .padding(20.dp)
+                .heightIn(max = 520.dp)
+                .clip(RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
+                .background(UiColor.Surface)
+                .border(1.dp, UiColor.GlassLine, RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
         ) {
-            Text(
-                "发现新版本 ${info.versionName.ifBlank { info.versionCode.toString() }}",
-                color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-
-            if (info.changelog.isNotBlank()) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color.White.copy(alpha = 0.06f))
-                        .padding(12.dp)
-                ) {
-                    info.changelog.split("\n").forEach { line ->
-                        if (line.isNotBlank()) {
-                            Text(
-                                "• $line",
-                                color = Color.White.copy(alpha = 0.85f),
-                                fontSize = 13.sp,
-                                lineHeight = 20.sp
-                            )
-                        }
-                    }
-                }
+            // ── ① 固定标题 ──（左边缘与所有菜单行一致）
+            Column(
+                modifier = Modifier.padding(
+                    start = MENU_EDGE_DP.dp, end = MENU_EDGE_DP.dp, top = MENU_EDGE_DP.dp
+                )
+            ) {
+                Text(
+                    "发现新版本 ${info.versionName.ifBlank { info.versionCode.toString() }}",
+                    color = UiColor.Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold
+                )
                 Spacer(modifier = Modifier.height(12.dp))
             }
 
-            val sizeText = AppUpdate.formatSize(info.sizeBytes)
-            if (sizeText.isNotEmpty()) {
-                Text("安装包大小约 $sizeText", color = Color.Gray, fontSize = 12.sp)
-                Spacer(modifier = Modifier.height(4.dp))
+            // ── ② 只有更新内容滚 ──
+            Column(
+                modifier = Modifier
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = MENU_EDGE_DP.dp)
+            ) {
+                if (info.changelog.isNotBlank()) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                            .background(UiColor.GlassPressed)
+                            .padding(12.dp)
+                    ) {
+                        info.changelog.split("\n").forEach { line ->
+                            if (line.isNotBlank()) {
+                                Text(
+                                    "• $line",
+                                    color = UiColor.Text,
+                                    fontSize = 13.sp,
+                                    lineHeight = 20.sp
+                                )
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
             }
-            Text(
-                "点击下载后会跳转到浏览器，下载完成手动安装即可。",
-                color = Color.Gray, fontSize = 12.sp
-            )
-            Spacer(modifier = Modifier.height(18.dp))
 
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                if (!info.force) {
+            // ── ③ 固定底部：大小 / 提示 / 前往安装（都不滚）──
+            Column(
+                modifier = Modifier.padding(
+                    start = 20.dp, end = 20.dp, bottom = 20.dp, top = 12.dp
+                )
+            ) {
+                val sizeText = AppUpdate.formatSize(info.sizeBytes)
+                if (sizeText.isNotEmpty()) {
+                    Text("安装包大小约 $sizeText", color = UiColor.TextDim, fontSize = 12.sp)
+                    Spacer(modifier = Modifier.height(4.dp))
+                }
+                Text(
+                    "点击下载后会跳转到浏览器，下载完成手动安装即可。",
+                    color = UiColor.TextDim, fontSize = 12.sp
+                )
+                Spacer(modifier = Modifier.height(18.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    if (!info.force) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
+                                .background(UiColor.GlassPressed)
+                                .clickable { onSkip() },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text("跳过此版本", color = UiColor.Text, fontSize = 14.sp)
+                        }
+                    }
                     Box(
                         modifier = Modifier
                             .weight(1f)
                             .height(46.dp)
-                            .clip(RoundedCornerShape(23.dp))
-                            .background(Color.White.copy(alpha = 0.12f))
-                            .clickable { onSkip() },
+                            .clip(RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
+                            .background(UiColor.Accent)
+                            .clickable {
+                                try {
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse(info.apkUrl))
+                                    )
+                                } catch (e: Exception) {
+                                    Log.e("Update", "打开下载链接失败", e)
+                                }
+                            },
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("跳过此版本", color = Color.White.copy(alpha = 0.8f), fontSize = 14.sp)
+                        // 原文案「去下载」，按你的叫法统一成「前往安装」。
+                        // 想改回只需动这一行。
+                        Text(
+                            "前往安装",
+                            color = Color.Black,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
-                }
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(46.dp)
-                        .clip(RoundedCornerShape(23.dp))
-                        .background(Color(0xFFFFA000))
-                        .clickable {
-                            try {
-                                context.startActivity(
-                                    Intent(Intent.ACTION_VIEW, Uri.parse(info.apkUrl))
-                                )
-                            } catch (e: Exception) {
-                                Log.e("Update", "打开下载链接失败", e)
-                            }
-                        },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text("去下载", color = Color.Black, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                 }
             }
         }
@@ -7467,6 +8489,191 @@ object PrefsWarmUp {
     }
 }
 
+// ==================== 用户协议（首次使用 / 版本更新后必须重新同意） ====================
+
+/**
+ * 协议正文。逐段排版，内容按需求原样保留，不做删改。
+ */
+private val USER_AGREEMENT_PARAGRAPHS: List<String> = listOf(
+    "此软件产生的任何问题包括但不限于“使用本软件后无法调用相机”“使用本软件后无法使用系统原相机”等一律不由作者负责。",
+    "严厉禁止使用本软件违反当地以及国家的任何法律法规，如违法则拉入黑名单并且造成的后果由使用者负责，作者概不负责。",
+    "本软件的源代码已在GitHub开源，使用MIT许可证网址为：https://github.com/hmjs2001/silky-camera-update",
+    "此软件使用的开源代码在软件内均有标明原作者、出处以及开源协议使用许可证。",
+    "如有疑问请发送至邮箱：3913171428@qq.com",
+    // ★适用范围★：放在收尾句之前，让「如不同意则无法使用」继续作结论
+    "此协议适用于此软件的所有版本。",
+    "如不同意则无法使用此软件。"
+)
+
+private object UserAgreement {
+    private const val PREFS: String = "user_agreement"
+    private const val KEY_ACCEPTED: String = "accepted_key"
+
+    /**
+     * 协议文本修订号。改上面正文时手动 +1，可在不发版的情况下强制所有用户重新同意。
+     * 本轮新增「此协议适用于此软件的所有版本。」→ 1 提到 2。
+     */
+    private const val POLICY_REVISION: Int = 2
+
+    /**
+     * 「版本钥匙」= 当前 App 的 versionCode + 协议修订号。
+     * 升级安装后 versionCode 变化 → 钥匙不同 → 重新弹窗，逻辑与首次完全一致。
+     */
+    private fun versionKey(context: Context): String =
+        AppUpdate.currentVersionCode(context).toString() + ":" + POLICY_REVISION.toString()
+
+    /** 是否已同意当前版本的协议。读失败按「未同意」处理，宁可多弹一次也不漏。 */
+    fun accepted(context: Context): Boolean =
+        try {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getString(KEY_ACCEPTED, null) == versionKey(context)
+        } catch (e: Exception) {
+            false
+        }
+
+    /** 只有点「同意并继续」才落盘；点「不同意」什么都不写，下次启动仍会弹。 */
+    fun accept(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putString(KEY_ACCEPTED, versionKey(context)).apply()
+    }
+}
+
+/** 协议窗口里的按钮：与全局按钮同一套中性色、圆角、按压弹簧与触点波纹 */
+@Composable
+private fun AgreementButton(
+    text: String,
+    primary: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val src = remember { MutableInteractionSource() }
+    val shape = RoundedCornerShape(10.dp)
+    Box(
+        modifier = modifier
+            .height(44.dp)
+            .bouncyPress(src)
+            .clip(shape)
+            // 主操作靠「亮一档」突出，不引入第二种颜色
+            .background(if (primary) UiColor.ChromeHi else Color.Transparent)
+            .border(
+                1.dp,
+                if (primary) UiColor.ChromeLineHi else UiColor.ChromeLine,
+                shape
+            )
+            .touchRipple(src)
+            .clickable(interactionSource = src, indication = null) { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text,
+            color = UiColor.Text,
+            fontSize = 13.sp,
+            fontWeight = if (primary) FontWeight.Bold else FontWeight.Normal
+        )
+    }
+}
+
+/**
+ * ★用户协议门★
+ *
+ * 放在 setContent 里 [CameraApp] 之后组合 —— Compose Dialog 是独立 Window，
+ * 最后组合的那个层级最高，能盖住机型选择、版本更新提示等所有其它弹窗。
+ *
+ * 规则：
+ *   · 首次使用 → 弹
+ *   · 点「不同意」→ 直接 finish() 退出，且不写任何状态 → 每次打开都弹
+ *   · 点「同意并继续」→ 写下当前版本钥匙 → 同版本内不再弹
+ *   · 升级到新版本 → versionCode 变化，钥匙对不上 → 重新弹，逻辑同首次
+ *
+ * dismissOnBackPress / dismissOnClickOutside 都是 false，onDismissRequest 空实现，
+ * 所以点外部、按系统返回键都绕不过去。
+ */
+@Composable
+fun UserAgreementGate() {
+    val context = LocalContext.current
+    var show: Boolean by remember { mutableStateOf(!UserAgreement.accepted(context)) }
+    if (!show) return
+
+    Dialog(
+        onDismissRequest = { /* 不允许关闭 */ },
+        properties = DialogProperties(
+            dismissOnBackPress = false,
+            dismissOnClickOutside = false
+        )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(UiColor.Surface)
+                .border(1.dp, UiColor.ChromeLine, RoundedCornerShape(16.dp))
+                .heightIn(max = 520.dp)
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp)
+        ) {
+            Text(
+                "用户协议",
+                color = UiColor.Text,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "首次使用或版本更新后需重新确认",
+                color = UiColor.TextDim,
+                fontSize = 12.sp
+            )
+            Spacer(Modifier.height(16.dp))
+
+            for (p in USER_AGREEMENT_PARAGRAPHS) {
+                Text(
+                    p,
+                    color = UiColor.Text,
+                    fontSize = 13.sp,
+                    lineHeight = 20.sp
+                )
+                Spacer(Modifier.height(12.dp))
+            }
+
+            // ★协议正文【下面】的附注★：不进 USER_AGREEMENT_PARAGRAPHS，
+            // 不是条款，只作提示 —— 居中、低对比、小一号字，与条款区分开。
+            Text(
+                "（使用即视为同意）",
+                color = UiColor.TextDim,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Spacer(Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                AgreementButton(
+                    text = "不同意",
+                    primary = false,
+                    onClick = {
+                        // 不写状态：下次启动仍会弹。直接退出，未同意前无法使用。
+                        (context as? ComponentActivity)?.finish()
+                    },
+                    modifier = Modifier.weight(1f)
+                )
+                AgreementButton(
+                    text = "同意并继续",
+                    primary = true,
+                    onClick = {
+                        UserAgreement.accept(context)
+                        show = false
+                    },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -7489,6 +8696,24 @@ class MainActivity : ComponentActivity() {
             // API 30+ 才有，Android 15/16 上边到边靠它
             window.setDecorFitsSystemWindows(false)
         }
+        //
+        // ★提升界面滑动帧率★：请求设备支持的最高刷新率（90 / 120 / 144Hz）。
+        // Compose 默认跟随窗口刷新率；部分 ROM 会把相机类 App 锁到 60Hz，
+        // 设置页滚动就会一卡一卡。preferredDisplayModeId 是 API 23+ 公开字段，
+        // 只挑 refreshRate 最高的那个 mode，不改分辨率、不动相机预览参数。
+        // 设置界面（以及关于页）的长列表滚动受益最明显。
+        //
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            @Suppress("DEPRECATION")
+            val display = windowManager.defaultDisplay
+            val best = display.supportedModes.maxByOrNull { it.refreshRate }
+            if (best != null) {
+                val attrs = window.attributes
+                attrs.preferredDisplayModeId = best.modeId
+                window.attributes = attrs
+                Log.d("SilkyCamera", "界面刷新率请求：${best.refreshRate}Hz")
+            }
+        }
         window.statusBarColor = android.graphics.Color.TRANSPARENT
         window.navigationBarColor = android.graphics.Color.TRANSPARENT
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -7510,6 +8735,9 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 CameraApp()
+                // ★用户协议★：最后组合，独立 Window 层级最高，
+                // 盖住机型选择 / 版本更新等所有弹窗；未同意前无法使用。
+                UserAgreementGate()
             }
         }
     }
@@ -7566,7 +8794,9 @@ fun CameraApp() {
     }
     val labelRotationAnim by animateFloatAsState(
         targetValue = shortestLabelRotation,
-        animationSpec = tween(durationMillis = 300, easing = FastOutSlowInEasing),
+        // ★与变焦共用同一条 motion 曲线★：起步快、尾段柔和收住，
+        // 420ms 落在主流「大布局变化」档；不再是生硬的 300ms 线性感。
+        animationSpec = tween(durationMillis = UI_ROTATE_MS, easing = ZOOM_EASE_IOS),
         label = "labelRotation"
     )
 
@@ -7682,7 +8912,7 @@ fun CameraApp() {
             )
         }
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("正在请求相机和麦克风权限...", color = Color.White)
+            Text("正在请求相机和麦克风权限...", color = UiColor.Ink)
         }
         return
     }
@@ -7904,6 +9134,8 @@ fun CameraApp() {
     var flashMode by remember { mutableIntStateOf(0) }
     // 点闪光灯后展开那一排图标，再点收起
     var flashExpanded by remember { mutableStateOf(false) }
+    /** ★录像画质★：true 时整条录制参数栏被画质选择条从左往右展开覆盖 */
+    var qualityExpanded by remember { mutableStateOf(false) }
     var showAbout by remember { mutableStateOf(false) }
     var showReward by remember { mutableStateOf(false) }
 
@@ -7935,6 +9167,61 @@ fun CameraApp() {
     var showColorPalette by remember { mutableStateOf(false) }
     /** 多级菜单：null=关闭，否则是"一级/二级"路径 */
     var menuPath by remember { mutableStateOf<String?>(null) }
+
+    //
+    // ★★设置界面打开时：不实时调用镜头★★
+    //
+    // 「设置界面」= 会盖住整个取景画面的全屏页 / 对话框：设置(关于)、
+    // 开源许可、赞赏、机型调校、星空设置。浮在预览上的小菜单 / 闪光面板
+    // 不算 —— 它们仍要透出取景画面。
+    //
+    // 录制中 / 星空堆栈中不暂停：解绑会中断录像或连拍，甚至留下损坏文件。
+    // 把这两个条件【放进判据本身】而不是放进 effect 分支里，是为了让
+    // LaunchedEffect 的 key 在录制期间保持不变 —— 否则 key 一变就会
+    // 取消并重启主绑定流程，等于在录制中重绑一次相机（这正是以前那次
+    // "半绑定假死"的成因）。
+    //
+    val settingsPagesOpen: Boolean = showAbout || showOssLicense || showReward ||
+            showDeviceTuning || showStarTrailSetup
+    val settingsBlockingCamera: Boolean =
+        settingsPagesOpen && !isRecording && !starTrailRunning
+    /** 关闭设置页后 +1，触发主绑定 effect 重跑一次（重新绑定 / 出图） */
+    var cameraResumeEpoch by remember { mutableIntStateOf(0) }
+    /** 普通数组：记录上一次是不是「暂停态」，避免首次组合就多绑一次相机 */
+    val wasCameraBlocked = remember { booleanArrayOf(false) }
+
+    LaunchedEffect(settingsBlockingCamera) {
+        if (settingsBlockingCamera) {
+            wasCameraBlocked[0] = true
+            // ★两道保险★
+            //  ① 主绑定 effect 的 key 已带上 settingsBlockingCamera：此刻旧绑定
+            //     流程被取消、新 effect 直接 return，不会再有后台流程重新绑定。
+            //  ② 仍做两次解绑：慢机型上旧协程可能正卡在 IO 的 bindToLifecycle，
+            //     取消协作式地晚几拍才真正退出，第二次解绑把这个尾巴收干净。
+            //  录制 / 星空堆栈期间判据恒 false，这段根本不会执行。
+            try {
+                val p = withContext(Dispatchers.IO) {
+                    ProcessCameraProvider.getInstance(context).get()
+                }
+                p.unbindAll()
+                delay(300)
+                // 用户中途关掉设置页 → 本 effect 已被取消，下面不会执行
+                p.unbindAll()
+                camera = null
+                imageCapture = null
+                videoCapture = null
+                lensSwitching = false
+                Log.d("Camera", "设置界面打开：已释放摄像头（不实时调用镜头）")
+            } catch (e: Exception) {
+                Log.w("Camera", "设置界面释放摄像头失败（忽略，不影响使用）", e)
+            }
+        } else if (wasCameraBlocked[0]) {
+            wasCameraBlocked[0] = false
+            // 恢复：让主绑定 effect 重跑一次，按当前设置重新绑定并出图
+            cameraResumeEpoch++
+            Log.d("Camera", "设置界面关闭：恢复相机绑定")
+        }
+    }
     /**
      * ★装不下的状态栏按键★
      * 由 SettingsChipsRow / SettingsChipsColumn 量完可用空间后回填，
@@ -7984,6 +9271,43 @@ fun CameraApp() {
     var halMaxZoomRatio by remember { mutableFloatStateOf(10.0f) }
     var maxZoomRatio by remember { mutableFloatStateOf(10.0f) }
     val minRatio = minZoomRatio
+
+    /**
+     * ★4K60 录制镜头锁定★
+     * false = 主摄（1~6x），true = 长焦 / 中长焦（原生倍率~20x）。
+     * 只在同一 Composable 内的局部函数里读，录制开始后不再允许修改，
+     * 于是 effMinZoom / effMaxZoom 在整个录制期间恒定 —— 镜头不会跳。
+     */
+    var lensLock4K60Tele by remember { mutableStateOf(false) }
+
+    /**
+     * ★★4K60 彩色闪屏：录制期间所有 capture-request 下发的统一闸门★★
+     *
+     * 上一轮只在 applySceneParams 里冻结，但录制中仍有别的路径会提交：
+     *   · applyProParams（专业模式滑条直接调它）
+     *   · applyStabilization / setStabilizationRaw（拖动变焦时挂起防抖）
+     *   · resetProParams
+     *   · ★每 16ms 一次的 setZoomRatio —— 每次改 crop region，HAL 在 4K60
+     *     余量为零时会顺带重算 AWB/CCM 增益，增益一跳画面就闪一段颜色★
+     *     （上一轮恰恰把这条放过了，这是「还是闪」最可能的主因）
+     *
+     * 判定用【已有的】量，不新增状态、不排队、不阻塞：
+     *   lastRecSceneSig 非空 = 开录后那次 3A 锁定首包已经下发完毕。
+     *   首包本身由 force=true 放行，之后整个录制期间全部静默。
+     *
+     * ⚠️ 内联了 isHeavyRecording 的判定 —— 那个局部函数声明在本文件更后面，
+     *    Kotlin 局部函数不能前向引用。
+     */
+    fun captureFrozen(): Boolean =
+        isRecording && mode == CaptureMode.VIDEO &&
+                (videoFrameRate.fps >= 60 || videoQuality == VideoQuality.UHD) &&
+                lastRecSceneSig.isNotEmpty()
+
+    /** ★4K 60 帧档位下禁用超广角（<1x）与广角物理头★ */
+    fun wideBannedFor4K60(): Boolean =
+        mode == CaptureMode.VIDEO &&
+                videoQuality == VideoQuality.UHD &&
+                videoFrameRate == VideoFrameRate.FPS_60
     val maxRatio = maxZoomRatio
     /** ★照片最高 50x、录像最高 15x★：模式决定 UI 上限 */
     // ★机型档案里还给了一个「可用上限」★：入门机拖到 50x 只会得到一团糊，
@@ -8026,6 +9350,21 @@ fun CameraApp() {
     // 真实物理头的倍率（光学档位），与按钮档位分开：
     // 按钮档位 = 光学档位 ∪ 常用档位，保证 2x 这类没有物理头的档位按钮依然存在
     var opticalStops by remember { mutableStateOf<List<Float>>(emptyList()) }
+
+    /**
+     * ★录制中的 4K60★
+     * 比 captureFrozen() 更宽：Start 到「AWB 收敛后首包」之间那一小段
+     * lastRecSceneSig 还是空的，captureFrozen 为 false，但视频已经在出流了。
+     * 这一段时间同样不能换镜头，所以换头判据用本函数。
+     */
+    fun recording4K60(): Boolean = isRecording && wideBannedFor4K60()
+
+    /**
+     * ★长焦 / 中长焦区间的起点 = 固定 5x★
+     * 原来按机型探测「最小的 >1x 光学档」，会把 2x/3.5x 也算成长焦，
+     * 区间起点随机器漂移。现在按需求写死 5x，所有机型一致、可预期。
+     */
+    fun teleBase4K60(): Float = ZOOM_4K60_TELE_MIN
     // 探测失败时为 false，此时退回写死的档位，行为跟以前一致
     var zoomStopsFromHardware by remember { mutableStateOf(false) }
     /**
@@ -8214,12 +9553,54 @@ fun CameraApp() {
     }
 
     /** 当前状态下的全局倍率下限（物理头直连时，最低就是这颗头自己的倍率） */
-    fun effMinZoom(): Float =
-        if (boundLensId != null) boundLensFactor() else minRatio
+    fun effMinZoom(): Float {
+        val base: Float = if (boundLensId != null) boundLensFactor() else minRatio
+        return when {
+            // 非 4K60：原样（广角可用）
+            !wideBannedFor4K60() -> base
+            // ★★开录前不预锁★★：4K60 档位下还没开始录，允许 1x~15x 自由变焦，
+            // 这样「录制刚开始时是什么镜头」才有意义 —— 锁定发生在 Start 那一刻。
+            // 广角（<1x）仍按原规则禁掉。
+            !isRecording -> maxOf(1f, base)
+            // ★录制中：锁定长焦/中长焦★ → 5x 起
+            lensLock4K60Tele -> teleBase4K60()
+            // ★录制中：锁定主摄★ → 1x 起
+            else -> maxOf(1f, base)
+        }
+    }
 
     /** 当前状态下的全局倍率上限（物理头上再给 4 倍数码裁切余量，但不超全局上限） */
-    fun effMaxZoom(): Float =
-        if (boundLensId != null) (boundLensFactor() * 4f).coerceAtMost(maxRatio) else maxRatio
+    fun effMaxZoom(): Float {
+        val base: Float =
+            if (boundLensId != null) (boundLensFactor() * 4f).coerceAtMost(maxRatio) else maxRatio
+        return when {
+            !wideBannedFor4K60() -> base
+            // ★★开录前不预锁★★：上限放到 15x，用户能先把画面推到长焦段再开录
+            !isRecording -> ZOOM_4K60_TELE_MAX
+            // ★录制中：锁定长焦/中长焦★ → 到 15x
+            lensLock4K60Tele -> ZOOM_4K60_TELE_MAX
+            // ★录制中：锁定主摄★ → 到 6x
+            else -> ZOOM_4K60_MAIN_MAX
+        }
+    }
+
+    /**
+     * ★4K60 下实际展示的变焦档位★
+     * 只留落在当前区间内的原厂档，并【补齐区间两端】，保证：
+     *   · 开录前（1~15x）一定有 1x 和 15x
+     *   · 录制中主摄（1~6x）一定有 1x 和 6x
+     *   · 录制中长焦（5~15x）一定有 5x 和 15x
+     * 非 4K60 时原封不动返回 zoomStops。
+     */
+    fun displayZoomStops(): List<Float> {
+        if (!wideBannedFor4K60()) return zoomStops
+        val lo: Float = effMinZoom()
+        val hi: Float = effMaxZoom()
+        val inRange: List<Float> = zoomStops.filter {
+            it >= lo - 0.01f && it <= hi + 0.01f
+        }
+        return (inRange + listOf(lo, hi)).distinct().sorted()
+    }
 
     /**
      * 真正下发给相机的倍率。
@@ -8544,7 +9925,8 @@ fun CameraApp() {
             //   ① 绑定时读到 HAL 原生下限 >= 1.0，但本机确实有 <1.0 的光学档
             //   ② 变焦校验发现目标 0.6x 实际回读是 1.0x
             // 没坐实之前一律不直连 —— 否则会抢掉本来能正常工作的 setZoomRatio。
-            boundLensId == null && logicWideBlocked && physicalWideWorks && target < 0.99f -> !sameLens
+            boundLensId == null && logicWideBlocked && physicalWideWorks &&
+                    target < 0.99f && !wideBannedFor4K60() -> !sameLens
 
             // ★长焦走物理直连★：不管当前在哪颗头上（逻辑头 / 广角头 / 另一颗长焦头）
             // ⚠️ 这里原来写的是 `boundLensId == null && tele != null`，只在【逻辑头】上才生效。
@@ -8686,6 +10068,7 @@ fun CameraApp() {
      * 回到拍照/录像模式画面会一直过曝或全黑。
      */
     fun resetProParams() {
+        if (captureFrozen()) return
         val cam = camera ?: return
         try {
             Camera2CameraControl.from(cam.cameraControl).clearCaptureRequestOptions()
@@ -8756,6 +10139,11 @@ fun CameraApp() {
         // 做法与 ⑨ 一致：允许随时调，但内容没变就不重复提交。
         //
         val recordingNow = isRecording
+        // ★4K60：首包之后整个录制期不再提交任何参数包★
+        if (captureFrozen() && !force) {
+            sceneParamsDirty = true
+            return
+        }
         val cam = camera ?: return
         if (mode != CaptureMode.PRO) return
         if (!manualControlSupported) return
@@ -9141,7 +10529,9 @@ fun CameraApp() {
             LensColorUnifier.appendTo(
                 b, lensColorKey(),
                 forceLockAwb = recordingNow,
-                keepAwbMode = recordingNow
+                keepAwbMode = recordingNow,
+                // ★4K/60：录制中不再重设 CCM，杜绝增益重算引起的彩色闪屏★
+                suppressColorGains = recordingNow && isHeavyRecording()
             )
 
             // ⑦ ★物理镜头切换★：不重新绑定，直接指定逻辑摄像头用哪颗物理头出图。
@@ -9204,6 +10594,30 @@ fun CameraApp() {
                 add(lensColorKey())            // ⑥ 当前镜头键
             }.joinToString("|")
 
+            //
+            // ★★4K60 彩色闪屏的最后一环：重负载录制冻结参数包★★
+            //
+            // 上面 sig 去重只能挡「内容完全一样」的重复提交。但录制期间
+            // 变焦挂起/恢复防抖、切镜头、看门狗自愈、切换档位…都会让 sig
+            // 里某项变化，于是 setCaptureRequestOptions 又被全量提交一次：
+            // HAL 重建 repeating request → 3A / CCM 增益被带着重算 →
+            // 画面一阵一阵偏色，观感就是「彩色闪屏」。4K60 下 HAL 余量为零，
+            // 任何一次重建都会被放大成可见的色跳。
+            //
+            // 修法：录制首包（force=true，等 AWB 收敛完那一次）下发后，
+            // 重负载档位在【整个录制期间】不再提交任何参数包；
+            // 变焦走 CameraX 的 setZoomRatio（不经过这里），功能不受影响。
+            // 被推迟的改动只记账，录制结束 applySceneParams() 会一次性补发。
+            //
+            if (captureFrozen() && !force) {
+                sceneParamsDirty = true
+                Log.d(
+                    "Camera",
+                    "4K/60 录制：参数包已冻结（首包锁定后不再重下发，杜绝 3A/CCM 重启导致的彩色闪屏）"
+                )
+                return
+            }
+
             val ctrl = Camera2CameraControl.from(cam.cameraControl)
             // CaptureRequestOptions 没有"移除某一项"的 API，先清空再整体下发，
             // 这样切回逻辑摄像头时 PHYSICAL_CAMERA_ID 才会真正消失。
@@ -9262,6 +10676,7 @@ fun CameraApp() {
      * ⚠️ 必须定义在 applyProParams 之后（Kotlin 局部函数只能引用前面已声明的）。
      */
     fun applyStabilization(enabled: Boolean) {
+        if (captureFrozen()) return
         val cam = camera ?: return
         // ⚠️ on 必须先算出来：下面专业模式分支也要用它
         val on = enabled && wantStabilization()
@@ -9512,10 +10927,23 @@ fun CameraApp() {
         //   改不了已绑定的用例，只能重建（跟 highResMode 一个道理）
         rawEnabled, rawForce, rawSingleOutput,
         // ★必须带上★：机型档案换了要强制重跑整套绑定 / 扫描 / 标定流程
-        deviceEpoch
+        deviceEpoch,
+        // ★设置界面关闭后恢复相机★：只在这一刻 +1，正常开录/停录不会触发重绑
+        cameraResumeEpoch,
+        // ★设置界面打开★：判据在录制 / 星空堆栈期间恒 false，key 不变，
+        //   所以绝不会在录制中取消并重跑绑定（历史假死的成因）。
+        settingsBlockingCamera
     ) {
         // 设置还没恢复完就别绑，否则会用默认值绑一次再重绑一次
         if (!settingsLoaded) return@LaunchedEffect
+
+        // ★设置界面打开期间不再绑定 / 不再出图★
+        // 摄像头已由上面那个独立 effect 解绑；这里提前返回，避免任何
+        // 参数下发 / 扫描 / 标定的后台动作继续「实时调用镜头」。
+        if (settingsBlockingCamera) {
+            Log.d("Camera", "设置界面打开：跳过相机绑定")
+            return@LaunchedEffect
+        }
 
         // ★★通过 PHYSICAL_CAMERA_ID 切镜头时【不重新绑定】★★
         // 会话一直是逻辑摄像头，只是每帧指定出图的物理头。
@@ -10130,6 +11558,7 @@ fun CameraApp() {
                     PHYSICAL_STREAM_TIMEOUT_STAB_MS else PHYSICAL_STREAM_TIMEOUT_MS
                 val streamed = waitForPreviewStream(pv, streamTimeout)
                 if (!streamed) {
+                    LensScanCache.noteBindFailure("物理头 $targetId 无预览流")
                     val thatFactor = (lensProfiles + physicalLensOptions)
                         .firstOrNull { it.id == targetId }?.zoomFactor ?: 1f
                     if (thatFactor < 0.95f) {
@@ -10181,6 +11610,7 @@ fun CameraApp() {
             //    （录制刚结束、分辨率瞬时冲突、HAL 忙），一次就封死等于这台机器
             //    这辈子都用不上物理长焦。改成累计 2 次才封。
             if (!bound && usePhysical) {
+                LensScanCache.noteBindFailure("物理头 $lensId 四档绑定全败")
                 // ⚠️ 原来这里无条件 physicalSwitchWorks = false 关总闸，见 [physicalPathOpen] 的说明
                 val isTeleTarget = (lensProfiles + physicalLensOptions)
                     .firstOrNull { it.id == lensId }?.zoomFactor
@@ -10374,7 +11804,7 @@ fun CameraApp() {
                             "HAL 上报下限 ${mn}x 但存在 ${opticalMin}x 光学档，已放宽到 ${finalMin}x"
                         )
                     }
-                    minZoomRatio = finalMin
+                    minZoomRatio = if (wideBannedFor4K60()) maxOf(1f, finalMin) else finalMin
                     halMaxZoomRatio = mx
                     maxZoomRatio = zoomCapFor(mx)
 
@@ -10636,6 +12066,7 @@ fun CameraApp() {
 
             scanDone = true
             lensSwitching = false
+            LensScanCache.noteBindSuccess()
 
             if (mode == CaptureMode.PRO && manualControlSupported) {
                 delay(DeviceCompatibility.manualSettleDelayMs)
@@ -10666,7 +12097,10 @@ fun CameraApp() {
                 stabSuspended = false
                 Log.d("Camera", "绑定异常：防抖挂起标志已复位")
             }
-            Log.e("Camera", "相机绑定流程异常（已置 scanDone=true 保底可用）", e)
+            LensScanCache.noteBindFailure("绑定流程异常")
+            rawSupportByFacing = emptyMap()
+            uhd60Supported = null
+            Log.e("Camera", "相机绑定流程异常（已置 scanDone=true 并作废缓存）", e)
             e.printStackTrace()
         }
         cameraReadyAfterSwitch = true
@@ -10905,15 +12339,59 @@ fun CameraApp() {
      * 现在改用 setZoomRatio()——它接受的是绝对倍率(1.0/2.0/5.0)，
      * CameraX 内部自己换算，不依赖我们的标定，稳得多。
      */
-    fun smoothZoomTo(targetRatio: Float) {
+    fun smoothZoomTo(rawTarget: Float) {
         val cam = camera ?: return
         if (!scanDone) return
+        //
+        // ★★4K60 锁定单一录制镜头★★
+        // 主摄 1~6x / 长焦原生倍率~20x：目标先夹进【当前锁定】的区间，
+        // 后面所有判定（boostTarget / 换头 / endRatio / 动画）都用夹后的值。
+        // 录制期间 lensLock4K60Tele 不会被修改，所以区间恒定 —— 绝不跨镜头。
+        //
+        val targetRatio: Float = if (wideBannedFor4K60())
+            rawTarget.coerceIn(effMinZoom(), effMaxZoom()) else rawTarget
+
+        //
+        // ★★OPPO「20x → 5x」卡顿专项：识别"大跨度回缩"★★
+        //
+        // 20x 通常落在扩展数码变焦区（halMax 之上，预览靠 graphicsLayer 缩放）。
+        // 从那里点 5x 时，OPPO/ColorOS 因为 preferPhysicalTele 会挑中一颗长焦头，
+        // wantTele 成立 → requestLensSwitchIfNeeded → unbindAll + bindToLifecycle
+        // + 切镜头前挂起防抖 + 纯黑遮罩等收敛，几百毫秒的卡顿就是这么来的。
+        // 而 5x 用【当前会话】的 setZoomRatio（必要时加一点扩展数码）本来就能平滑走到，
+        // 换头只是把同一段倍率换个承担者，收益极小、代价极大。
+        //
+        // 判据（四条同时成立才算回缩，管得足够窄）：
+        //   · 起点在 HAL 上限之外（确实是扩展数码区）
+        //   · 目标不到起点的 60%（明显往回缩，不是 20→18 这种微调）
+        //   · 目标 >= TELE_ENTER_RATIO（不是回广角 —— 广角物理直连是功能正确性，
+        //     已有的 logicWideBlocked 兜底必须保留，绝不能顺手禁掉）
+        //   · 非录制状态（录制中本就一律不换头，也不改节流）
+        //
+        // 注意：只挡【预防性】换头。动画结束后的"下发后校验"若读回发现真没到位，
+        // requestLensSwitchIfNeeded(endRatio) 仍会照常兜底，功能不丢。
+        //
+        val fromRatio: Float = displayedRatio
+        val boostRetrace: Boolean =
+            fromRatio > halMaxZoomRatio + 0.01f &&
+                    targetRatio < fromRatio * 0.6f &&
+                    targetRatio >= DeviceCompatibility.TELE_ENTER_RATIO &&
+                    !isRecording && !recording4K60()
+        if (boostRetrace) {
+            Log.d(
+                "Camera",
+                "★大跨度回缩★ ${"%.2f".format(fromRatio)}x→${"%.2f".format(targetRatio)}x " +
+                        "（halMax=${"%.2f".format(halMaxZoomRatio)}x）：" +
+                        "本次不预防性换头，放宽下发/UI 节流"
+            )
+        }
         // 超过 HAL 上限的部分走扩展数码变焦：记下用户真正想要的目标
         boostTarget = if (targetRatio > halMaxZoomRatio + 0.01f) targetRatio else 0f
         // 只有在【实测坐实】逻辑头到不了广角时才换物理头。
         // ⚠️ 这里曾经无条件调用 requestLensSwitchIfNeeded，等于每次变焦都先尝试直连，
         //    结果把本来 setZoomRatio 能正常工作的机型搞坏了。现在严格限定条件。
-        val wantWide = logicWideBlocked && physicalWideWorks && targetRatio < 0.99f
+        val wantWide = logicWideBlocked && physicalWideWorks &&
+                targetRatio < 0.99f && !wideBannedFor4K60()
         // 统一用 pickTeleFor（容差与 requestLensSwitchIfNeeded 完全一致，避免两边判定打架）
         val teleForTarget: DeviceCompatibility.LensProfile? = pickTeleFor(targetRatio)
         //
@@ -10928,11 +12406,14 @@ fun CameraApp() {
         //
         // ⚠️ 只挡"预防性换头"(wantTele)，不挡下面的 stuckOnLens：
         //    卡在某颗头上必须换是功能正确性问题，该换还得换。
+        //    ★例外★：下面 boostRetrace 判据成立时两者都挡 —— 那是"20x→5x"
+        //    这类大跨度回缩，当前会话本来就能平滑走到，换头只是一次白付的重绑。
         // ⚠️ 只在 boundLensId == null 时挡：已经直连在某颗头上时，
         //    halMax 要乘 boundLensFactor，判定基准不一样，不能套用。
         //
         val beyondHalTarget = boundLensId == null && targetRatio > halMaxZoomRatio + 0.01f
-        val wantTele = !beyondHalTarget && teleForTarget != null && teleForTarget.id != boundLensId
+        val wantTele = !beyondHalTarget && !boostRetrace &&
+                teleForTarget != null && teleForTarget.id != boundLensId
         if (beyondHalTarget && teleForTarget != null) {
             Log.d(
                 "Camera",
@@ -10947,9 +12428,13 @@ fun CameraApp() {
         //    于是根本不会调用 requestLensSwitchIfNeeded ——
         //    停在那颗广角头上，endRatio 被 effMaxZoom()（0.6×4=2.4）夹成 2.4x。
         //    表现就是"点 10x 只到 2.4x / 完全没反应"。
-        val stuckOnLens: Boolean = boundLensId != null &&
+        val stuckOnLens: Boolean = !boostRetrace && boundLensId != null &&
                 (targetRatio > effMaxZoom() + 0.01f || targetRatio < effMinZoom() - 0.01f)
-        if (wantWide || wantTele || stuckOnLens) {
+        // ★4K60 录制中一律不换头★：多摄各头 CCM 不同，切一次颜色跳一次；
+        // recording4K60() 覆盖 Start→AWB 首包那一小段（captureFrozen 此时还没生效）。
+        // requestLensSwitchIfNeeded 本身也有 isRecording 保护，这里再挡一层更稳。
+        if (!recording4K60() && !captureFrozen() &&
+            (wantWide || wantTele || stuckOnLens)) {
             //
             // ★★换头前必须先掐掉正在跑的变焦动画★★
             //
@@ -11052,10 +12537,51 @@ fun CameraApp() {
                 // ★① 时长只看倍率跨度，且在对数域算★
                 // ln(1→10) 与 ln(10→1) 绝对值相同 → 两个方向的时长天然一致。
                 val spanLog = abs(ln(endRatio / startRatio.coerceAtLeast(0.01f)))
-                val durationMs = (ZOOM_ANIM_BASE_MS - spanLog * ZOOM_ANIM_SPAN_FACTOR_LOG)
-                    .coerceIn(ZOOM_ANIM_MIN_MS, ZOOM_ANIM_BASE_MS).toLong()
-                val stepMs = if (isRecording) ZOOM_ANIM_STEP_MS_REC else ZOOM_ANIM_STEP_MS
-                val steps = (durationMs / stepMs).toInt().coerceAtLeast(1)
+                val baseDurationMs: Float =
+                    (ZOOM_ANIM_BASE_MS - spanLog * ZOOM_ANIM_SPAN_FACTOR_LOG)
+                        .coerceIn(ZOOM_ANIM_MIN_MS, ZOOM_ANIM_BASE_MS)
+                // ★短焦权重：取两端倍率的较小值线性插值，全程连续、无分段★
+                // 与 easing 无关：所有方向、所有焦段都用同一条 SYMMETRIC_ZOOM_EASE，
+                // 只是时长被同一个连续函数轻微拉长，不会出现「短→长换了一条曲线」。
+                val minEnd: Float = minOf(startRatio, endRatio)
+                val shortWeight: Float = ((ZOOM_SHORT_FOCAL_MAX - minEnd) /
+                        (ZOOM_SHORT_FOCAL_MAX - ZOOM_SHORT_FOCAL_MIN)).coerceIn(0f, 1f)
+                val durationMs: Long = (baseDurationMs *
+                        (1f + (ZOOM_SHORT_FOCAL_SLOWDOWN - 1f) * shortWeight))
+                    .coerceAtMost(ZOOM_ANIM_BASE_MS * ZOOM_SHORT_FOCAL_SLOWDOWN)
+                    .toLong()
+                val stepMs: Long = when {
+                    isRecording -> ZOOM_ANIM_STEP_MS_REC
+                    // OPPO / 一加 / realme 同宗 ColorOS HAL，回缩时再宽一档
+                    boostRetrace && DeviceCompatibility.isOppo -> ZOOM_ANIM_STEP_MS_RETRACE_OPPO
+                    boostRetrace -> ZOOM_ANIM_STEP_MS_RETRACE
+                    else -> ZOOM_ANIM_STEP_MS
+                }
+                //
+                // ★★录制中也走完整非线性变焦★★
+                //
+                // 上一版为了压 4K60 彩闪，把 captureFrozen() 期间的动画压成
+                // step=1「一步到位」，结果 4K60 / 1080P60 录制中点档位变成硬切。
+                // 现在 4K60 与 1080P60 走【完全相同】的这一条代码路径：
+                //   · 同一条 SYMMETRIC_ZOOM_EASE、同一个对数域插值、多步动画
+                //   · 录制步长用 ZOOM_ANIM_STEP_MS_REC(24ms)，比待机 16ms 稀疏 1/3，
+                //     既保住曲线的顺滑感，又不把 4K60 编码器的 HAL 余量吃满
+                //   · coerceAtLeast(2) 保证再短也至少两步，不会退化回硬切
+                //
+                // 彩闪的其余防护全部保留：captureFrozen() 仍闸住所有参数包下发
+                // （applySceneParams / 防抖挂起 / COLOR_CORRECTION_GAINS）、
+                // skipParams = isRecording、recording4K60() 录制中一律不换头。
+                // ⚠️ 取舍：逐帧 setZoomRatio 回来了，若个别机型 4K60 仍偶发偏色，
+                //    见本轮说明里的「把步长调稀 / 回退一步到位」两种旋钮。
+                //
+                val steps: Int = (durationMs / stepMs).toInt().coerceAtLeast(2)
+                // ★回缩段把 UI 提交节流也放宽★：displayedRatio 每写一次
+                // 就重组整棵 CameraApp，这是原注释里"变焦卡顿的元凶"。
+                val uiThrottle: Long = when {
+                    isRecording -> ZOOM_UI_REFRESH_MS_REC
+                    boostRetrace -> ZOOM_UI_REFRESH_MS_RETRACE
+                    else -> ZOOM_UI_REFRESH_MS
+                }
                 // ★② 插值改到对数域★：r = exp(lnStart + (lnEnd - lnStart) * eased)
                 //    单位时间内变化的「倍率比例」恒定，正反向曲线互为镜像。
                 val lnStart = ln(startRatio.coerceAtLeast(0.01f))
@@ -11070,7 +12596,7 @@ fun CameraApp() {
                 Log.d(
                     "Camera",
                     "变焦 ${"%.2f".format(startRatio)}→${"%.2f".format(endRatio)}" +
-                            " 下发${steps}步/${stepMs}ms UI刷新${ZOOM_UI_REFRESH_MS}ms"
+                            " 下发${steps}步/${stepMs}ms UI刷新${uiThrottle}ms"
                 )
 
                 // ★HAL 下发去重★
@@ -11098,8 +12624,6 @@ fun CameraApp() {
 
                     // ② UI 状态只在攒够间隔时才提交——重组很贵，必须节流
                     val now = System.currentTimeMillis()
-                    val uiThrottle =
-                        if (isRecording) ZOOM_UI_REFRESH_MS_REC else ZOOM_UI_REFRESH_MS
                     if (step == steps || now - lastUiAt >= uiThrottle) {
                         displayedRatio = r
                         lastUiAt = now
@@ -11690,6 +13214,9 @@ fun CameraApp() {
         // 高像素模式下没有录像用例（三流共存会把拍照分辨率压到 1200万），
         // 切进录像时要先退出高像素，否则点录制会没反应
         if (next == CaptureMode.VIDEO && highResMode) highResMode = false
+        // ★录像模式没有调色盘★：万一切模式时它还开着，立刻收掉，
+        // 避免「录像中却浮着调色盘」的半吊子状态。
+        if (next == CaptureMode.VIDEO) showColorPalette = false
 
         // ★进录像前回到逻辑摄像头★
         // 录制中换头要 unbindAll，会直接把视频打断，所以录制期间一律不换头；
@@ -12249,6 +13776,47 @@ fun CameraApp() {
                 is VideoRecordEvent.Start -> {
                     isRecording = true
                     //
+                    // ★4K60：开录瞬间若还停在超广角，先回主摄 1x★
+                    // 很多机型的超广角头根本不出 4K60 流，HAL 被迫重配 / 插值，
+                    // 表现就是整段视频一阵一阵彩色闪烁。
+                    // 这里用的是 CameraX 的 setZoomRatio（不重建参数包），
+                    // 与录制中的「不重配」原则一致。
+                    if (wideBannedFor4K60()) {
+                        //
+                        // ★★录制刚开始时是什么镜头，整段就只调用什么镜头★★
+                        //
+                        // isRecording 上面已置 true，effMin/effMax 从这一刻起按锁定区间算。
+                        // 判定不靠用户预选的 chip，而是看【开录这一刻的实际画面】：
+                        //   · 当前倍率 ≥5x            → 长焦/中长焦
+                        //   · 或已直连在倍率 ≥5x 的物理头上 → 长焦/中长焦
+                        //   其余                      → 主摄
+                        // 菜单里的两个镜头预选项已取消，开录前不再有预选，
+                        // 完全由开录瞬间实际画面决定，避免"选了主摄却在长焦段开录"。
+                        //
+                        val actualTele: Boolean =
+                            displayedRatio >= ZOOM_4K60_TELE_MIN - 0.01f ||
+                                    (boundLensId != null &&
+                                            boundLensFactor() >= ZOOM_4K60_TELE_MIN - 0.01f)
+                        lensLock4K60Tele = actualTele
+
+                        val lo: Float = effMinZoom()
+                        val hi: Float = effMaxZoom()
+                        val clamped: Float = displayedRatio.coerceIn(lo, hi)
+                        // 开录前停在广角 / 或倍率落在另一段，都在这里归位。
+                        // 用 setZoomRatio（不重建参数包），与「录制中不重配」一致。
+                        if (abs(clamped - displayedRatio) > 0.01f) {
+                            camera?.cameraControl?.setZoomRatio(clampForHal(clamped))
+                            displayedRatio = clamped
+                        }
+                        Log.d(
+                            "Camera",
+                            "4K60 开录：按实际镜头锁定" +
+                                    (if (actualTele) "长焦/中长焦(5~15x)" else "主摄(1~6x)") +
+                                    "，变焦区间 ${"%.2f".format(lo)}x~${"%.2f".format(hi)}x" +
+                                    "，当前 ${"%.2f".format(displayedRatio)}x"
+                        )
+                    }
+                    //
                     // ★震动：确认"真的开始录了"★
                     //   点击和真正出流之间有一段延迟（编码器初始化），
                     //   没有这个反馈的话，用户会以为没点上、然后多点几下。
@@ -12364,33 +13932,18 @@ fun CameraApp() {
     val toneActive: Boolean =
         toneIntensity > 0f && (abs(toneWarmth) > 0.5f || abs(toneTint) > 0.5f)
     //
-    // ★★预览叠加色：改用与成片【同一个】[toneGains]★★
+    // ★★影调只用 [toneGains] 这一个真源★★
     //
-    // 原来这里用的是 0.5±0.5w/100 这套"另算的近似色"，
-    // 跟成片的实际增益毫无关系 —— 预览挺明显、成片几乎没变，
-    // 这就是"影调色彩不对"的直接表现。
+    // 成片 postProcessPhoto、调色盘盘面、面板里的「当前影调」色块
+    // 全部共用同一组增益，不再各算一套近似色 —— 这是"预览挺明显、
+    // 成片几乎没变"的根治。
     //
-    // 现在：取成片作用下的【中性灰】(0.5,0.5,0.5) → (0.5·rG, 0.5·gG, 0.5·bG)，
-    // 把它作为叠加色。方向严格一致（暖调 → 叠加色偏红 → 画面偏暖），
-    // 于是"预览看到的"就是"成片得到的"。
-    //
-    val toneOverlayColor: Color = if (!toneActive) Color.Transparent else {
-        //
-        // 成片对【中性灰】的输出（0..1）—— 预览要严格复现它
-        //
-        val g = toneGains(toneWarmth, toneTint, toneIntensity)
-        val o = floatArrayOf(0.5f * g[0], 0.5f * g[1], 0.5f * g[2])
-        //
-        // ★解析求出叠加色，使预览的中性灰 = 成片的中性灰★
-        //
-        val ov = tonePreviewOverlay(o[0], o[1], o[2], TONE_PREVIEW_ALPHA)
-        Color(
-            red = ov[0],
-            green = ov[1],
-            blue = ov[2],
-            alpha = TONE_PREVIEW_ALPHA
-        )
-    }
+    // ⚠️ 取景画面【不做】任何绘制层调色（不再生成 ColorMatrix / 不再 saveLayer）：
+    //   PreviewView 在 PERFORMANCE 模式是 SurfaceView，宿主 canvas 上要打
+    //   「透明洞」它才透得出来。saveLayer 会把打洞动作关进离屏 buffer，
+    //   restore 时整块 layer 盖回去，主 canvas 的洞没打成 → 露出黑底，
+    //   表现正是「一改调色盘整个画面变黑」。
+    //   成片依然真变色；预览反馈改放在调色盘面板里（见 AppleColorPalette）。
 
     //
     // ★★切换 RAW（DNG）拍摄格式★★
@@ -12509,13 +14062,26 @@ fun CameraApp() {
         onRawForceToggle = { toggleRawForce() },
         onRawSingleToggle = { toggleRawSingleOutput() },
         onVideoQualityChange = { videoQuality = it },
+        // ★整条参数栏从左往右展开★（同时收起闪光灯面板，两个不会叠在一起）
+        onQualityExpand = {
+            flashExpanded = false
+            qualityExpanded = true
+        },
         onVideoFrameRateChange = { videoFrameRate = it },
         onStabilizationChange = { stabMode = it },
         onPhotoRatioChange = { photoRatio = it },
-        onFlashExpand = { flashExpanded = true },
+        onFlashExpand = {
+            qualityExpanded = false
+            flashExpanded = true
+        },
         onAbout = { showAbout = true },
         onColorPalette = { showColorPalette = true },
-        onMenu = { menuPath = "" }
+        onMenu = {
+            // 菜单自带遮罩，别让画质条/闪光面板留在它下面叠着
+            qualityExpanded = false
+            flashExpanded = false
+            menuPath = ""
+        }
     )
 
     /**
@@ -12526,6 +14092,7 @@ fun CameraApp() {
         when {
             showColorPalette -> showColorPalette = false
             menuPath != null -> menuPath = null
+            qualityExpanded -> qualityExpanded = false
             flashExpanded -> flashExpanded = false
             showReward -> showReward = false
             showAbout -> showAbout = false
@@ -12638,7 +14205,12 @@ fun CameraApp() {
                 if (scanTicks == 16) {
                     scanDone = true
                     lensSwitching = false
-                    Log.w("Camera", "★自愈★ scanDone 卡关 8s，已强制放行（相机操作恢复）")
+                    LensScanCache.markInvalid("scanDone 卡关 8s 自愈")
+                    try { DeviceCompatibility.clearProbeCache() }
+                    catch (e: Exception) { Log.w("Camera", "自愈清理缓存失败（不影响放行）", e) }
+                    rawSupportByFacing = emptyMap()
+                    uhd60Supported = null
+                    Log.w("Camera", "★自愈★ scanDone 卡关 8s，已强制放行并作废全部缓存")
                 }
 
                 // ⑥ calibrating：校准弹窗停在「校准中…」→ 只能杀进程
@@ -12701,6 +14273,8 @@ fun CameraApp() {
     // ★下发文字旋转角★：界面没跟着屏幕转时，UI 上的文字靠这个转正。
     // 跟随旋转时是 0，等于什么都不做，不会有副作用。
     CompositionLocalProvider(LocalLabelRotation provides labelRotationAnim) {
+        // ★上下黑边 = 纯黑★：取景框外的 letterbox 不透过任何背景，
+        // 切镜头用的纯黑遮罩（下面 lensSwitching 那块）同样是纯黑。
         Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
 
             // ── 苹果风格调色盘 ──
@@ -12962,15 +14536,12 @@ fun CameraApp() {
                         // 横屏：在居中的基础上向左微调，平衡右侧"变焦+拍摄+模式栏"三列
                         // 占掉的空间。只是微调，画面整体仍然居中。
                         .offset(x = if (relayoutLandscape) (-40).dp else 0.dp)
-                        .drawWithContent {
-                            // 预览原样绘制，不再按焦段套滤镜（见上方 isUltraWide 处的说明）
-                            drawContent()
-                            // ★调色盘在预览上的近似呈现★
-                            // 真实色偏在成片上由后处理套用，这里只是让你在取景时就能看到色调走向
-                            if (toneActive) {
-                                drawRect(color = toneOverlayColor)
-                            }
-                        }
+                        // ★★取景画面不做任何绘制层调色★★
+                        // 上一版在这里用 drawWithContent + saveLayer + ColorFilter，
+                        // 与 SurfaceView 模式的 PreviewView「透明洞」冲突，
+                        // 一改调色盘就把整块画面盖成黑底。现在整段移除，
+                        // 让 AndroidView 原生绘制；成片改色由 postProcessPhoto 负责，
+                        // 预览反馈放在调色盘面板的「当前影调」色块里。
                         .pointerInput(Unit) {
                             detectTransformGestures { _, _, zoomChange, _ ->
                                 if (isFront) return@detectTransformGestures
@@ -12981,7 +14552,7 @@ fun CameraApp() {
 
                                 // 拖动变焦期间同样挂起防抖，否则 EIS/OIS 与 crop 变化打架会卡。
                                 // 这里没有明确的"结束"回调，靠后面的超时检测恢复。
-                                if (wantStabilization() && !stabSuspended) {
+                                if (wantStabilization() && !stabSuspended && !captureFrozen()) {
                                     setStabilizationRaw(false)
                                     stabSuspended = true
                                 }
@@ -13047,6 +14618,10 @@ fun CameraApp() {
                 )
             }
 
+            // ★黑边 ↔ 预览框：保持纯硬切，不加任何过渡 / 模糊★
+            // 全屏仍是纯黑 letterbox；不叠任何离屏层 / 渐变 / 绘制修饰，
+            // SurfaceView 的透明洞完全不受影响（历史全黑 bug 的根因）。
+
             //
             //
             // ★★UI 隐藏（双击空白处切换）★★
@@ -13082,7 +14657,7 @@ fun CameraApp() {
                     CompositionGuides(
                         horizonDeg = horizonDeg,
                         visible = showGuides && !isFront,
-                        // ★镜头朝地面 → 只隐藏水平仪，三分线保留★
+                        // ★镜头朝下俯角 ≥45° → 只隐藏水平仪，三分线保留★
                         levelVisible = !facingGround
                     )
                 }
@@ -13172,7 +14747,8 @@ fun CameraApp() {
                 // ── 参数栏（像素 / 画质 / 帧率 / 防抖 / 比例 / 旋转 / 闪光 / 关于）──
                 // 竖屏：横排放在顶部。横屏：改到屏幕左边竖排（见下方横屏分支），
                 // 因为横屏时顶部那条很窄，参数挤在一排会压住取景框。
-                if (!relayoutLandscape) {
+                // ★按键文字无底板★：展开时原 chips 不再画，否则两层白字会叠在一起
+                if (!relayoutLandscape && !qualityExpanded) {
                     SettingsChipsRow(
                         modifier = Modifier
                             .align(Alignment.TopCenter)
@@ -13184,20 +14760,29 @@ fun CameraApp() {
                         onHiddenChange = { hiddenChipIds = it }
                     )
                 }
-                // ── 闪光灯展开：全屏透明层，点任意地方关闭 ──
-                // 放在顶部栏之后绘制，所以它盖在下面所有控件之上；
-                // 选择面板再画在它之上，这样点面板上的图标不会被关掉。
-                if (flashExpanded) {
+                // ── 全屏点击层放在顶部栏之后 ──
+                // 盖住取景画面与参数栏；选择面板再画在它之上，
+                // 这样点面板上的图标不会被关掉。
+                // ── 全屏点击层：点「其他地方」就收起 ──
+                // 闪光灯展开时保留 0.35 黑遮罩；画质条展开时【完全透明】
+                // （画质条是替换参数栏、不是浮层，不该压暗整个画面）。
+                // 绘制顺序：参数栏 → 本层 → 闪光面板 / 画质条。
+                // 所以画质条与闪光面板仍可点，点其余区域一律关闭。
+                if (flashExpanded || qualityExpanded) {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .background(Color.Black.copy(alpha = 0.25f))
+                            .background(
+                                if (flashExpanded) Color.Black.copy(alpha = 0.35f)
+                                else Color.Transparent
+                            )
                             .clickable(
-                                // 去掉点击水波纹，纯透明关闭层不该有反馈
+                                // 去掉点击水波纹，纯关闭层不该有反馈
                                 indication = null,
                                 interactionSource = remember { MutableInteractionSource() }
                             ) {
                                 flashExpanded = false
+                                qualityExpanded = false
                             }
                     )
                 }
@@ -13209,21 +14794,14 @@ fun CameraApp() {
                         .align(Alignment.TopCenter)
                         .statusBarsPadding()
                         .padding(top = 56.dp),
-                    enter = fadeIn(tween(120)) + scaleIn(
-                        animationSpec = spring(
-                            dampingRatio = Spring.DampingRatioMediumBouncy,
-                            stiffness = Spring.StiffnessMedium
-                        ),
-                        initialScale = 0.75f
-                    ),
-                    exit = fadeOut(tween(100)) + scaleOut(targetScale = 0.85f)
+                    enter = POPUP_ENTER,
+                    exit = POPUP_EXIT
                 ) {
                     Row(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(22.dp))
-                            .background(Color.Black.copy(alpha = 0.75f))
-                            .border(1.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(22.dp))
-                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                            // ★所有面板共用 softGlass★：与多级菜单同一套材质 / 圆角
+                            .softGlass(cornerDp = MENU_RADIUS_OUTER_DP, emphasized = true)
+                            .padding(horizontal = 8.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.spacedBy(4.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -13252,13 +14830,13 @@ fun CameraApp() {
                                     }
                                     .clip(CircleShape)
                                     .background(
-                                        if (flashMode == m) Color.White.copy(alpha = 0.25f)
+                                        if (flashMode == m) UiColor.ChromeHi
                                         else Color.Transparent
                                     )
                                     .border(
                                         1.dp,
-                                        if (flashMode == m) Color(0xFFFFC107)
-                                        else Color.Transparent,
+                                        if (flashMode == m) UiColor.ChromeLineHi
+                                        else UiColor.ChromeLine,
                                         CircleShape
                                     )
                                     .clickable {
@@ -13276,10 +14854,10 @@ fun CameraApp() {
 
                 if (!scanDone) {
                     Box(
-                        modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.6f)),
+                        modifier = Modifier.fillMaxSize().background(Color.White.copy(alpha = 0.88f)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("正在校准...", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        Text("正在校准...", color = UiColor.Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                     }
                 }
 
@@ -13306,14 +14884,106 @@ fun CameraApp() {
                         verticalArrangement = Arrangement.Center,
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        SettingsChipsColumn(
-                            st = settingsBarState,
-                            act = settingsBarActions,
-                            hidden = hiddenChipIds,
-                            onHiddenChange = { hiddenChipIds = it }
-                        )
+                        // ★按键文字无底板★：同上，展开时不再画原竖排 chips
+                        if (!qualityExpanded) {
+                            SettingsChipsColumn(
+                                st = settingsBarState,
+                                act = settingsBarActions,
+                                hidden = hiddenChipIds,
+                                onHiddenChange = { hiddenChipIds = it }
+                            )
+                        }
                     }
 
+                }
+
+                // ── 录像画质：整条参数栏【向右滑入弹出】，占掉整条状态栏 ──
+                // 放在【两条参数栏都绘制完之后】，所以它是后画的、能真正盖住原 chips。
+                // 不是浮在画面中间的小面板：位置、尺寸都与参数栏完全重合，
+                // 背景不透明，滑入到位后整条只剩 1080P / 4K 两个选择。
+                // 点开期间由下方的全屏透明点击层负责「点其他地方就关闭」。
+                AnimatedVisibility(
+                    visible = qualityExpanded,
+                    modifier = if (relayoutLandscape) {
+                        // 横屏：参数栏是左侧竖排，覆盖条与它同位置同尺寸
+                        Modifier
+                            .align(Alignment.CenterStart)
+                            .navigationBarsPadding()
+                            .padding(start = 10.dp + cutoutLeftDp)
+                            .width(56.dp)
+                            .fillMaxHeight(0.9f)
+                    } else {
+                        // 竖屏：参数栏是顶部横排，覆盖条铺满整行
+                        Modifier
+                            .align(Alignment.TopCenter)
+                            .statusBarsPadding()
+                            .padding(top = if (uiCompact) 6.dp else 12.dp)
+                            .fillMaxWidth()
+                    },
+                    enter = QUALITY_STRIP_ENTER,
+                    exit = QUALITY_STRIP_EXIT
+                ) {
+                    if (relayoutLandscape) {
+                        // 横屏窄栏：两项竖排，与竖排 chips 的排法一致
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .clip(RoundedCornerShape(TOP_CHIP_CORNER))
+                                // ★按键文字无底板★：画质条与下面的 chips 同为纯透明，
+                                // 靠「不画原 chips」来替换，而不是盖一层色板
+                                .clickable(
+                                    indication = null,
+                                    interactionSource = remember { MutableInteractionSource() }
+                                ) { qualityExpanded = false }
+                                .padding(horizontal = 4.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.Center,
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            for (q in VideoQuality.values()) {
+                                TopChip(
+                                    text = q.label,
+                                    selected = videoQuality == q,
+                                    onClick = {
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        videoQuality = q
+                                        qualityExpanded = false
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    compact = true
+                                )
+                            }
+                        }
+                    } else {
+                        // 竖屏整行：两项各占一半，铺满整条参数状态栏
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(40.dp)
+                                .clip(RoundedCornerShape(TOP_CHIP_CORNER))
+                                // ★按键文字无底板★：与参数栏 chip 一致
+                                .clickable(
+                                    indication = null,
+                                    interactionSource = remember { MutableInteractionSource() }
+                                ) { qualityExpanded = false }
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            for (q in VideoQuality.values()) {
+                                TopChip(
+                                    text = q.label,
+                                    selected = videoQuality == q,
+                                    onClick = {
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        videoQuality = q
+                                        qualityExpanded = false
+                                    },
+                                    // weight 让两档平分整条宽度 —— 这就是「占掉整个状态栏」
+                                    modifier = Modifier.weight(1f).fillMaxHeight()
+                                )
+                            }
+                        }
+                    }
                 }
 
                 // 竖屏：整块控制区在底部居中；横屏：挪到屏幕【右侧】垂直居中
@@ -13390,7 +15060,7 @@ fun CameraApp() {
                             )
                         }
 
-                        Spacer(modifier = Modifier.height(6.dp))
+                        Spacer(modifier = Modifier.height(8.dp))
 
                         Row(
                             modifier = Modifier.pointerInput(Unit) {
@@ -13409,7 +15079,9 @@ fun CameraApp() {
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             // 档位按钮 = 光学档位 ∪ 常用档位（2x 等没有物理头的档位保留，走数码变焦）
-                            zoomStops.forEach { zoom ->
+                            // ★4K60★：只画【当前锁定镜头区间】内的档位，且补齐 1x/6x
+                            // 或「长焦原生倍率/20x」两端（广角档一律不画）。
+                            displayZoomStops().forEach { zoom ->
                                 val isSelected = when {
                                     zoom == 2.0f && abs(selectedZoom - 3.5f) < 0.05f -> true
                                     abs(selectedZoom - zoom) < 0.05f -> true
@@ -13419,10 +15091,16 @@ fun CameraApp() {
                                 // ★真实存在的光学档位例外★：小米 / iQOO 上 zoomState 常只报 min=1.0，
                                 // 按范围过滤会把 0.6x 超广角按钮弄没 —— 点它时走"物理头直连"兜底。
                                 val isOptical = opticalStops.any { o -> abs(o - zoom) < 0.01f }
-                                val allowed = isOptical ||
-                                        (zoom >= minRatio - 0.01f && zoom <= maxRatio + 0.01f &&
-                                                // 高画质模式只允许真实光学档
-                                                (!highResMode || isOpticalStop(zoom)))
+                                val allowed = if (wideBannedFor4K60()) {
+                                    // ★4K60★：区间已经由 displayZoomStops 保证，
+                                    // 这里不再用全局 maxRatio（录像上限 15x）去卡 20x 按钮。
+                                    zoom >= effMinZoom() - 0.01f && zoom <= effMaxZoom() + 0.01f
+                                } else {
+                                    isOptical ||
+                                            (zoom >= minRatio - 0.01f && zoom <= maxRatio + 0.01f &&
+                                                    // 高画质模式只允许真实光学档
+                                                    (!highResMode || isOpticalStop(zoom)))
+                                }
 
                                 ZoomButton(
                                     label = formatStop(zoom),
@@ -13459,8 +15137,8 @@ fun CameraApp() {
                                             horizontal = if (vertical) 0.dp else 24.dp,
                                             vertical = 8.dp
                                         )
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(Color.Black.copy(alpha = 0.5f))
+                                        .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                                        .background(UiColor.GlassHi)
                                         .padding(12.dp),
                                     contentAlignment = Alignment.Center
                                 ) {
@@ -13470,10 +15148,10 @@ fun CameraApp() {
                                         fontSize = 11.sp,
                                         textAlign = TextAlign.Center,
                                         // ★只旋转文字★
-                                        modifier = Modifier.rotate(LocalLabelRotation.current)
+                                        modifier = Modifier.rotatedLabel()
                                     )
                                 }
-                                if (!vertical) Spacer(modifier = Modifier.height(10.dp))
+                                if (!vertical) Spacer(modifier = Modifier.height(8.dp))
                             } else {
                                 ProControls(
                                     vertical = vertical,
@@ -13513,7 +15191,7 @@ fun CameraApp() {
                                     activeParam = proActiveParam,
                                     onActiveParamChange = { proActiveParam = it }
                                 )
-                                if (!vertical) Spacer(modifier = Modifier.height(10.dp))
+                                if (!vertical) Spacer(modifier = Modifier.height(8.dp))
                             }
                         }
                     }
@@ -13527,8 +15205,8 @@ fun CameraApp() {
                     val captureControls: @Composable () -> Unit = {
                         Box(
                             modifier = Modifier
-                                .size(52.dp).clip(RoundedCornerShape(8.dp))
-                                .background(Color.White.copy(alpha = 0.15f))
+                                .size(52.dp).clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                                .background(UiColor.Chrome)
                                 .clickable { showGallery = true },
                             contentAlignment = Alignment.Center
                         ) {
@@ -13542,7 +15220,7 @@ fun CameraApp() {
                                     contentDescription = "相册",
                                     // tint 白色：图标本身是纯白，这里统一着色便于以后改配色
                                     colorFilter = androidx.compose.ui.graphics.ColorFilter
-                                        .tint(Color.White),
+                                        .tint(UiColor.Ink),
                                     modifier = Modifier.size(26.dp)
                                 )
                             }
@@ -13571,7 +15249,7 @@ fun CameraApp() {
                         Box(
                             modifier = Modifier
                                 .size(52.dp).clip(CircleShape)
-                                .background(Color.White.copy(alpha = 0.15f))
+                                .background(UiColor.Chrome)
                                 .clickable {
                                     if (isFlipping) return@clickable
                                     //
@@ -13636,7 +15314,7 @@ fun CameraApp() {
                                 painter = painterResource(R.drawable.ic_flip_camera),
                                 contentDescription = "切换前后摄",
                                 colorFilter = androidx.compose.ui.graphics.ColorFilter
-                                    .tint(Color.White),
+                                    .tint(UiColor.Ink),
                                 modifier = Modifier.size(26.dp)
                             )
                         }
@@ -13673,18 +15351,26 @@ fun CameraApp() {
                                     // ★强行补一个 10x★：很多机器的 zoomStops 里没有 10x
                                     // （原厂档位只到 5x），但数码变焦上限通常到 10x 甚至更高，
                                     // 横屏竖向空间够放 6 个，就把 10x 补上。
-                                    val landscapeStops = remember(zoomStops, opticalStops, maxRatio) {
-                                        val optical = zoomStops.filter { z ->
-                                            opticalStops.any { o -> abs(o - z) < 0.01f }
+                                    val landscapeStops = remember(
+                                        zoomStops, opticalStops, maxRatio,
+                                        lensLock4K60Tele, videoQuality, videoFrameRate
+                                    ) {
+                                        if (wideBannedFor4K60()) {
+                                            // ★4K60★：直接用锁定区间的档位（含补齐的两端）
+                                            displayZoomStops().sortedDescending().take(6)
+                                        } else {
+                                            val optical = zoomStops.filter { z ->
+                                                opticalStops.any { o -> abs(o - z) < 0.01f }
+                                            }
+                                            val extras = listOf(1.0f, 2.0f).filter { it in zoomStops }
+                                            // 10x 只要没超出这台机器的变焦上限就加上
+                                            val ten = listOf(10.0f).filter { it <= maxRatio + 0.01f }
+                                            (optical + extras + ten)
+                                                .distinct()
+                                                .sortedDescending()
+                                                .take(6)
+                                                .ifEmpty { zoomStops.sortedDescending().take(6) }
                                         }
-                                        val extras = listOf(1.0f, 2.0f).filter { it in zoomStops }
-                                        // 10x 只要没超出这台机器的变焦上限就加上
-                                        val ten = listOf(10.0f).filter { it <= maxRatio + 0.01f }
-                                        (optical + extras + ten)
-                                            .distinct()
-                                            .sortedDescending()
-                                            .take(6)
-                                            .ifEmpty { zoomStops.sortedDescending().take(6) }
                                     }
                                     Column(
                                         verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -13699,9 +15385,14 @@ fun CameraApp() {
                                             // 光学档位无条件可用（哪怕 HAL 上报的变焦范围不含它，
                                             // 点它会走"物理头直连"），其它档位仍按变焦范围判断
                                             val isOptical = opticalStops.any { o -> abs(o - zoom) < 0.01f }
-                                            val allowed = isOptical ||
-                                                    (zoom >= minRatio - 0.01f && zoom <= maxRatio + 0.01f &&
-                                                            (!highResMode || isOpticalStop(zoom)))
+                                            val allowed = if (wideBannedFor4K60()) {
+                                                zoom >= effMinZoom() - 0.01f &&
+                                                        zoom <= effMaxZoom() + 0.01f
+                                            } else {
+                                                isOptical ||
+                                                        (zoom >= minRatio - 0.01f && zoom <= maxRatio + 0.01f &&
+                                                                (!highResMode || isOpticalStop(zoom)))
+                                            }
 
                                             ZoomButton(
                                                 label = formatStop(zoom),
@@ -13719,6 +15410,7 @@ fun CameraApp() {
                             }
 
                             Column(
+                                modifier = Modifier.height(88.dp),
                                 verticalArrangement = Arrangement.spacedBy(12.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
@@ -13747,14 +15439,9 @@ fun CameraApp() {
                                     if (panelOpen && curMode == CaptureMode.PRO && !isFront) {
                                         Box(
                                             modifier = Modifier
-                                                .clip(RoundedCornerShape(16.dp))
-                                                .background(Color.Black.copy(alpha = 0.82f))
-                                                .border(
-                                                    1.dp,
-                                                    Color.White.copy(alpha = 0.18f),
-                                                    RoundedCornerShape(16.dp)
-                                                )
-                                                .padding(horizontal = 10.dp, vertical = 12.dp)
+                                                // ★所有面板共用 softGlass★
+                                                .softGlass(cornerDp = MENU_RADIUS_OUTER_DP)
+                                                .padding(horizontal = MENU_EDGE_DP.dp, vertical = 12.dp)
                                         ) {
                                             ProParamPanel(
                                                 activeParam = proActiveParam,
@@ -13809,12 +15496,14 @@ fun CameraApp() {
                                 cfg = starTrailConfig,
                                 running = starTrailRunning
                             ) { showStarTrailSetup = true }
-                            Spacer(modifier = Modifier.height(10.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
                         }
                         Spacer(modifier = Modifier.height(16.dp))
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
+                                // ★修复 Bug2★：固定行高，切模式时不再被子项高度带偏
+                                .height(88.dp)
                                 .padding(horizontal = 28.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
@@ -13903,7 +15592,7 @@ fun CameraApp() {
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .background(Color.Black.copy(alpha = 0.25f))
+                            .background(Color.Black.copy(alpha = 0.35f))
                             .clickable(
                                 indication = null,
                                 interactionSource = remember { MutableInteractionSource() }
@@ -14000,11 +15689,12 @@ fun CameraApp() {
                         ) {
                             MultiLevelMenu(
                                 path = menuPath ?: "",
+                                visible = menuPath != null,
                                 onPathChange = { menuPath = it },
                                 st = settingsBarState,
                                 act = settingsBarActions,
                                 overflow = buildChipSpecs(settingsBarState, settingsBarActions)
-                                    .filter { it.id in hiddenChipIds },
+                                    .filter { it.menuOnly || it.id in hiddenChipIds },
                                 // 整体转过来，而不是逐条旋转文字（逐条转会重叠，见 MenuItem 里的说明）
                                 rotation = labelRotationAnim,
                                 maxContentHeight = menuMaxHeight,
@@ -14021,11 +15711,12 @@ fun CameraApp() {
                     } else {
                         MultiLevelMenu(
                             path = menuPath ?: "",
+                            visible = menuPath != null,
                             onPathChange = { menuPath = it },
                             st = settingsBarState,
                             act = settingsBarActions,
                             overflow = buildChipSpecs(settingsBarState, settingsBarActions)
-                                .filter { it.id in hiddenChipIds },
+                                .filter { it.menuOnly || it.id in hiddenChipIds },
                             maxContentHeight = menuMaxHeight,
                             guidesOn = showGuides,
                             onGuidesChange = { showGuides = it },
@@ -14349,13 +16040,10 @@ fun ProControls(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(bottom = 10.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(Color.Black.copy(alpha = 0.55f))
-                        .border(
-                            1.dp, Color.White.copy(alpha = 0.15f), RoundedCornerShape(14.dp)
-                        )
-                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                        .padding(bottom = 8.dp)
+                        // ★所有面板共用 softGlass★
+                        .softGlass(cornerDp = MENU_RADIUS_OUTER_DP)
+                        .padding(horizontal = MENU_EDGE_DP.dp, vertical = 12.dp)
                 ) {
                     panelContent()
                 }
@@ -14399,16 +16087,16 @@ fun ProCircleButton(
     // 横屏竖排时 6 个 56dp 的圈会顶满甚至溢出屏幕高度，缩到 46dp
     size: Dp = 56.dp
 ) {
+    // ★参数调整栏统一：透明底 + 白字★（选中态仍用唯一强调色）
     val bgColor = when {
-        isActive -> Color(0xFFFFC107)
-        isReset -> Color.Transparent
-        else -> Color.Black.copy(alpha = 0.4f)
+        isActive -> Color(0xFFFFA000)
+        else -> UiColor.ParamBg
     }
-    val textColor = if (isActive) Color.Black else Color.White
+    val textColor = if (isActive) Color.Black else UiColor.ParamText
     val borderColor = when {
         isActive -> Color.Transparent
         isReset -> Color.Transparent
-        else -> Color.White.copy(alpha = 0.2f)
+        else -> UiColor.GlassLine
     }
 
     // ★交互动画★：按下缩到 0.88、选中时略微放大到 1.06，抬手回弹
@@ -14416,7 +16104,7 @@ fun ProCircleButton(
     val bgAnimated = rememberPressColor(
         interactionSource = src,
         normal = bgColor,
-        pressedColor = if (isActive) Color(0xFFFFD54F) else Color.White.copy(alpha = 0.28f)
+        pressedColor = if (isActive) Color(0xFFFFA000) else UiColor.GlassPressed
     )
 
     Box(
@@ -14426,6 +16114,7 @@ fun ProCircleButton(
             .clip(CircleShape)
             .background(bgAnimated)
             .border(1.dp, borderColor, CircleShape)
+            .touchRipple(src)
             .clickable(
                 interactionSource = src,
                 indication = null
@@ -14443,18 +16132,18 @@ fun ProCircleButton(
                 fontWeight = FontWeight.Bold,
                 maxLines = 1,
                 // ★只旋转文字★
-                modifier = Modifier.rotate(LocalLabelRotation.current)
+                modifier = Modifier.rotatedLabel()
             )
             if (label.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(1.dp))
                 Text(
                     text = label,
-                    color = if (isActive) Color.Black.copy(alpha = 0.7f)
-                    else Color.White.copy(alpha = 0.6f),
+                    color = if (isActive) UiColor.TextDim
+                    else UiColor.ParamTextDim,
                     fontSize = 9.sp,
                     maxLines = 1,
                     // ★只旋转文字★
-                    modifier = Modifier.rotate(LocalLabelRotation.current)
+                    modifier = Modifier.rotatedLabel()
                 )
             }
         }
@@ -14527,16 +16216,16 @@ fun ProSlider(
                             (range.endInclusive - range.start)).coerceIn(0f, 1f)
                 } else 0f
                 // 自动状态时用灰色轨道提示
-                val activeColor = if (isAuto) Color.White.copy(alpha = 0.3f)
-                else Color(0xFFFFC107)
-                val thumbOuter = if (isAuto) Color.White.copy(alpha = 0.5f)
-                else Color(0xFFFFC107)
+                val activeColor = if (isAuto) Color.Black.copy(alpha = 0.3f)
+                else Color(0xFFFFA000)
+                val thumbOuter = if (isAuto) Color.Black.copy(alpha = 0.5f)
+                else Color(0xFFFFA000)
 
                 if (vertical) {
                     val x = w / 2f
                     // 底轨
                     drawLine(
-                        color = Color.White.copy(alpha = 0.18f),
+                        color = Color.Black.copy(alpha = 0.18f),
                         start = Offset(x, 0f),
                         end = Offset(x, h),
                         strokeWidth = 3.dp.toPx(),
@@ -14546,7 +16235,7 @@ fun ProSlider(
                     for (i in 0..10) {
                         val yy = h * i / 10f
                         drawLine(
-                            color = Color.White.copy(alpha = 0.3f),
+                            color = Color.Black.copy(alpha = 0.3f),
                             start = Offset(x - 4.dp.toPx(), yy),
                             end = Offset(x + 4.dp.toPx(), yy),
                             strokeWidth = 1.dp.toPx()
@@ -14567,14 +16256,14 @@ fun ProSlider(
                         center = Offset(x, cy)
                     )
                     drawCircle(
-                        color = Color.White,
+                        color = UiColor.Ink,
                         radius = 4.dp.toPx(),
                         center = Offset(x, cy)
                     )
                 } else {
                     val y = h / 2f
                     drawLine(
-                        color = Color.White.copy(alpha = 0.18f),
+                        color = Color.Black.copy(alpha = 0.18f),
                         start = Offset(0f, y),
                         end = Offset(w, y),
                         strokeWidth = 3.dp.toPx(),
@@ -14583,7 +16272,7 @@ fun ProSlider(
                     for (i in 0..10) {
                         val x = w * i / 10f
                         drawLine(
-                            color = Color.White.copy(alpha = 0.3f),
+                            color = Color.Black.copy(alpha = 0.3f),
                             start = Offset(x, y - 4.dp.toPx()),
                             end = Offset(x, y + 4.dp.toPx()),
                             strokeWidth = 1.dp.toPx()
@@ -14602,7 +16291,7 @@ fun ProSlider(
                         center = Offset(w * frac, y)
                     )
                     drawCircle(
-                        color = Color.White,
+                        color = UiColor.Ink,
                         radius = 4.dp.toPx(),
                         center = Offset(w * frac, y)
                     )
@@ -14618,11 +16307,11 @@ fun ProSlider(
                 .size(30.dp)
                 .clip(CircleShape)
                 .background(
-                    if (isAuto) Color(0xFFFFC107) else Color.White.copy(alpha = 0.12f)
+                    if (isAuto) Color(0xFFFFA000) else UiColor.Chrome
                 )
                 .border(
                     1.dp,
-                    if (isAuto) Color.Transparent else Color.White.copy(alpha = 0.25f),
+                    if (isAuto) Color.Transparent else UiColor.GlassLine,
                     CircleShape
                 )
                 .clickable {
@@ -14633,11 +16322,11 @@ fun ProSlider(
         ) {
             Text(
                 text = "A",
-                color = if (isAuto) Color.Black else Color.White,
+                color = if (isAuto) Color.Black else UiColor.TextDim,
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Bold,
                 // ★只旋转文字★
-                modifier = Modifier.rotate(LocalLabelRotation.current)
+                modifier = Modifier.rotatedLabel()
             )
         }
     }
@@ -14656,25 +16345,25 @@ fun ProSlider(
             ) {
                 Text(
                     label,
-                    color = Color.White.copy(alpha = 0.75f),
+                    color = UiColor.Ink,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
                     // ★只旋转文字★
-                    modifier = Modifier.rotate(LocalLabelRotation.current)
+                    modifier = Modifier.rotatedLabel()
                 )
                 Spacer(modifier = Modifier.weight(1f))
                 autoBtn()
             }
             Text(
                 displayValue,
-                color = if (isAuto) Color.White.copy(alpha = 0.6f) else Color.White,
+                color = if (isAuto) UiColor.TextFaint else UiColor.Ink,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Medium,
                 textAlign = TextAlign.Center,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 // ★只旋转文字★
-                modifier = Modifier.rotate(LocalLabelRotation.current)
+                modifier = Modifier.rotatedLabel()
             )
             Spacer(modifier = Modifier.height(2.dp))
             track(
@@ -14689,21 +16378,21 @@ fun ProSlider(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     label,
-                    color = Color.White.copy(alpha = 0.75f),
+                    color = UiColor.Ink,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
                     // ★只旋转文字★
-                    modifier = Modifier.rotate(LocalLabelRotation.current)
+                    modifier = Modifier.rotatedLabel()
                 )
                 Spacer(modifier = Modifier.weight(1f))
                 Text(
                     displayValue,
-                    color = if (isAuto) Color.White.copy(alpha = 0.6f) else Color.White,
+                    color = if (isAuto) UiColor.TextFaint else UiColor.Ink,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
                     textAlign = TextAlign.End,
                     // ★只旋转文字★
-                    modifier = Modifier.rotate(LocalLabelRotation.current)
+                    modifier = Modifier.rotatedLabel()
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 autoBtn()
@@ -14724,13 +16413,13 @@ fun ProSlider(
         ) {
             Text(
                 label,
-                color = Color.White.copy(alpha = 0.75f),
+                color = UiColor.Ink,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Bold,
                 // ★只旋转文字★
                 modifier = Modifier
                     .width(34.dp)
-                    .rotate(LocalLabelRotation.current)
+                    .rotatedLabel()
             )
             track(
                 Modifier
@@ -14740,18 +16429,85 @@ fun ProSlider(
             )
             Text(
                 displayValue,
-                color = if (isAuto) Color.White.copy(alpha = 0.6f) else Color.White,
+                color = if (isAuto) UiColor.TextFaint else UiColor.Ink,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Medium,
                 modifier = Modifier
                     .width(52.dp)
                     // ★只旋转文字★
-                    .rotate(LocalLabelRotation.current),
+                    .rotatedLabel(),
                 textAlign = TextAlign.End
             )
             Spacer(modifier = Modifier.width(8.dp))
             autoBtn()
         }
+    }
+}
+
+/**
+ * ★★渐进式披露（Progressive Disclosure）★★
+ *
+ * 默认只让用户看到高频 / 必要的信息；低频项、测试项、冗长明细收在
+ * 一行「更多」后面，点开才用展开动画露出来。避免一进设置就被一长串
+ * 选项糊脸，同时功能一个都不丢。
+ *
+ * 标题行用与 MenuItem 完全相同的左边缘 / 行高 / 按压反馈，保证视觉对齐。
+ * 展开态用普通 remember：切换子页时折叠回去是符合直觉的（每次进页面
+ * 都从最简洁的状态开始），不做跨页面持久化。
+ */
+@Composable
+private fun DisclosureSection(
+    title: String,
+    expandedLabel: String = "收起",
+    collapsedLabel: String = "展开",
+    content: @Composable ColumnScope.() -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val src = remember { MutableInteractionSource() }
+    val bg = rememberPressColor(
+        interactionSource = src,
+        normal = Color.Transparent,
+        pressedColor = UiColor.GlassPressed
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .graphicsLayer()
+            .bouncyPress(src, pressed = 0.97f)
+            .background(bg)
+            .touchRipple(src)
+            .clickable(interactionSource = src, indication = null) {
+                expanded = !expanded
+            }
+            .padding(horizontal = MENU_EDGE_DP.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            title,
+            color = UiColor.Text,
+            fontSize = 13.sp,
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            if (expanded) expandedLabel else collapsedLabel,
+            color = UiColor.TextDim,
+            fontSize = 12.sp
+        )
+    }
+    AnimatedVisibility(
+        visible = expanded,
+        enter = expandVertically(
+            expandFrom = Alignment.Top,
+            animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing)
+        ) + fadeIn(tween(160)),
+        exit = shrinkVertically(
+            shrinkTowards = Alignment.Top,
+            animationSpec = tween(durationMillis = 180)
+        ) + fadeOut(tween(140))
+    ) {
+        Column { content() }
     }
 }
 
@@ -14765,12 +16521,14 @@ fun AboutScreen(
     onOpenOssLicense: () -> Unit = {}
 ) {
     val haptic = LocalHapticFeedback.current
+    /** ★关于页里的「用户协议」只读全文★（与首次启动那道门共用同一份正文） */
+    var showAgreement by remember { mutableStateOf(false) }
     // 排查"最新版还弹更新"时看这一行：它必须 >= update.json 里的 versionCode
     val context = LocalContext.current
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF0D0D0D))
+            .background(UiColor.Surface)
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             Row(
@@ -14784,118 +16542,248 @@ fun AboutScreen(
                     modifier = Modifier
                         .size(40.dp)
                         .clip(CircleShape)
-                        .background(Color.White.copy(alpha = 0.1f))
+                        .background(UiColor.Wash)
                         .clickable {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             onClose()
                         },
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("←", color = Color.White, fontSize = 20.sp)
+                    Text("←", color = UiColor.Ink, fontSize = 20.sp)
                 }
                 Spacer(modifier = Modifier.width(16.dp))
-                Text("设置", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text("设置", color = UiColor.Ink, fontSize = 20.sp, fontWeight = FontWeight.Bold)
             }
 
-            Spacer(modifier = Modifier.weight(1f))
-
+            // ★中间内容区：占满剩余高度【且可滚动】★
+            // 原来这里靠前后两个 Spacer(weight 1f) 把卡片撑到垂直居中，
+            // 但外层 Column 没有滚动、卡片高度不可压缩 —— 一旦卡片内容变长
+            // （上一轮加了「用户协议」入口约 90dp）超过屏幕，两个 weight 被压成 0，
+            // 底部捐赠就被挤出屏幕看不见了。
+            // 改成 weight(1f) + verticalScroll：卡片再长也只是滚动，
+            // 底部捐赠作为外层最后一个固定子项，永远可见。
             Column(
                 modifier = Modifier
+                    .weight(1f)
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    // ★滚动帧率★：关于页卡片同样走 layer 合成
+                    .graphicsLayer()
+                    .clipToBounds()
                     .padding(horizontal = 32.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text(APP_DISPLAY_NAME, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.height(24.dp))
+                Text(APP_DISPLAY_NAME, color = UiColor.Ink, fontSize = 24.sp, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(8.dp))
-                Text("版本 $APP_VERSION_NAME", color = Color.White.copy(alpha = 0.5f), fontSize = 14.sp)
+                Text("版本 $APP_VERSION_NAME", color = UiColor.TextDim, fontSize = 14.sp)
 
-                Spacer(modifier = Modifier.height(40.dp))
+                Spacer(modifier = Modifier.height(32.dp))
 
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(16.dp))
-                        .background(Color.White.copy(alpha = 0.05f))
-                        .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(16.dp))
-                        .padding(20.dp)
+                        .background(UiColor.Wash)
+                        .border(1.dp, UiColor.Border, RoundedCornerShape(16.dp))
+                        .padding(MENU_EDGE_DP.dp)
                 ) {
                     AboutRow(label = "版本", value = APP_VERSION_NAME)
-                    Spacer(modifier = Modifier.height(14.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
                     // 更新判断用的是这个整数（来自 build.gradle），不是上面那个字符串。
                     // 它小于 update.json 的 versionCode 就会一直弹更新 —— 发版务必同步递增
                     AboutRow(
                         label = "版本码",
                         value = AppUpdate.currentVersionCode(context).toString()
                     )
-                    Spacer(modifier = Modifier.height(14.dp))
-                    Spacer(modifier = Modifier.height(14.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(Color.White.copy(alpha = 0.06f))
+                            .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                            .background(UiColor.Wash)
                             .clickable {
                                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                 onOpenDeviceTuning()
                             }
-                            .padding(horizontal = 14.dp, vertical = 12.dp)
+                            .padding(horizontal = MENU_EDGE_DP.dp, vertical = 12.dp)
                     ) {
                         Column {
                             Text(
                                 text = "机型与色彩",
-                                color = Color.White,
+                                color = UiColor.Ink,
                                 fontSize = 14.sp,
                                 fontWeight = FontWeight.Medium
                             )
-                            Spacer(modifier = Modifier.height(3.dp))
+                            Spacer(modifier = Modifier.height(4.dp))
                             Text(
                                 text = "重新选择品牌 / 系列、开关统一镜头色彩、校准当前镜头",
-                                color = Color.White.copy(alpha = 0.45f),
+                                color = UiColor.TextDim,
                                 fontSize = 11.sp
                             )
                         }
                     }
-                    Spacer(modifier = Modifier.height(14.dp))
-                    AboutRow(label = "制作", value = "Kotlin + Jetpack Compose + CameraX")
-                    Spacer(modifier = Modifier.height(14.dp))
-                    AboutRow(label = "制作人", value = "hmjs")
-                    Spacer(modifier = Modifier.height(14.dp))
-                    AboutRow(label = "b站/抖音", value = "小码-初中")
+                    //
+                    // ★★渐进式披露★★：默认只显示版本 / 机型与色彩 /
+                    // 【开源使用许可】/ 用户协议；制作信息、免责声明这类
+                    // 低频明细收进「详细信息」。点开才展开，设置页第一屏
+                    // 不再被长列表塞满。
+                    //
+                    // ⚠️「开源使用许可」刻意不进折叠区：用户协议第 4 条承诺
+                    //   「软件内均有标明原作者、出处以及开源协议使用许可证」，
+                    //   合规声明必须一眼可见，不能被折叠藏起来。
+                    //
+                    Spacer(modifier = Modifier.height(12.dp))
+                    DisclosureSection(title = "详细信息") {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        AboutRow(label = "制作", value = "Kotlin + Jetpack Compose + CameraX")
+                        Spacer(modifier = Modifier.height(12.dp))
+                        AboutRow(label = "制作人", value = "hmjs")
+                        Spacer(modifier = Modifier.height(12.dp))
+                        AboutRow(label = "b站/抖音", value = "小码-初中")
 
-                    // ── 免责声明：放在关于卡片最后一行 ──
-                    Spacer(modifier = Modifier.height(14.dp))
-                    // 用 Box 画分隔线，不依赖 material3 的 Divider（版本差异可能没有）
+                        // ── 免责声明 ──
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(1.dp)
+                                .background(UiColor.Line)
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = "此软件造成的任何问题不由作者承担。",
+                            color = UiColor.TextDim,
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        Spacer(modifier = Modifier.height(4.dp))
+                    }
+
+                    // ── ★开源使用许可：默认可见的一级入口★ ──
+                    // 用户协议第 4 条的合规承诺，不收进上面的折叠区。
+                    Spacer(modifier = Modifier.height(12.dp))
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(1.dp)
-                            .background(Color.White.copy(alpha = 0.10f))
+                            .background(UiColor.Line)
                     )
-                    Spacer(modifier = Modifier.height(14.dp))
-                    Text(
-                        text = "此软件造成的任何问题不由作者承担。",
-                        color = Color.White.copy(alpha = 0.55f),
-                        fontSize = 12.sp,
-                        lineHeight = 18.sp,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    // ── 开源使用声明：放在设置卡片【最后】──
-                    Spacer(modifier = Modifier.height(14.dp))
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(1.dp)
-                            .background(Color.White.copy(alpha = 0.10f))
-                    )
-                    Spacer(modifier = Modifier.height(14.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
                     OssLicenseEntry(onOpen = onOpenOssLicense)
+
+                    // ── ★用户协议：放在关于卡片【最下面】★ ──
+                    // 与首次启动 / 版本更新时那道「必须同意」的门共用同一份正文
+                    // (USER_AGREEMENT_PARAGRAPHS)。这里只是只读查看，随时可关。
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(1.dp)
+                            .background(UiColor.Line)
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                            .background(UiColor.Wash)
+                            .clickable {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                showAgreement = true
+                            }
+                            .padding(horizontal = MENU_EDGE_DP.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "用户协议",
+                                color = UiColor.Ink,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "免责声明、使用限制、开源许可与联系方式",
+                                color = UiColor.TextDim,
+                                fontSize = 11.sp
+                            )
+                        }
+                        Text(text = "›", color = UiColor.TextDim, fontSize = 18.sp)
+                    }
+
+                    // 只读全文弹窗（独立 Window，放在卡片里也能正常组合）
+                    if (showAgreement) {
+                        Dialog(
+                            onDismissRequest = { showAgreement = false },
+                            properties = DialogProperties(usePlatformDefaultWidth = false)
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 24.dp)
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .background(UiColor.Surface)
+                                    .border(
+                                        1.dp,
+                                        UiColor.ChromeLine,
+                                        RoundedCornerShape(16.dp)
+                                    )
+                                    .heightIn(max = 520.dp)
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(16.dp)
+                            ) {
+                                Text(
+                                    "用户协议",
+                                    color = UiColor.Text,
+                                    fontSize = 18.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Spacer(Modifier.height(8.dp))
+                                Text(
+                                    "首次使用或版本更新后需重新确认",
+                                    color = UiColor.TextDim,
+                                    fontSize = 12.sp
+                                )
+                                Spacer(Modifier.height(16.dp))
+                                for (p in USER_AGREEMENT_PARAGRAPHS) {
+                                    Text(
+                                        p,
+                                        color = UiColor.Text,
+                                        fontSize = 13.sp,
+                                        lineHeight = 20.sp
+                                    )
+                                    Spacer(Modifier.height(12.dp))
+                                }
+                                // ★与协议门同一条附注★：正文下面、按钮上面
+                                Text(
+                                    "（使用即视为同意）",
+                                    color = UiColor.TextDim,
+                                    fontSize = 12.sp,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                Spacer(Modifier.height(4.dp))
+                                AgreementButton(
+                                    text = "关闭",
+                                    primary = false,
+                                    onClick = { showAgreement = false },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                        }
+                    }
                 }
+                Spacer(modifier = Modifier.height(24.dp))
             }
 
-            Spacer(modifier = Modifier.weight(1f))
-
+            // ★底部捐赠：固定在外层 Column 末尾，不受中间内容滚动影响★
+            // 原有 navigationBarsPadding + bottom 24dp 保持不变，
+            // 全面屏手势条下也不会被挡。
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -14906,9 +16794,9 @@ fun AboutScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(Color(0xFFFFC107).copy(alpha = 0.15f))
-                        .border(1.dp, Color(0xFFFFC107).copy(alpha = 0.5f), RoundedCornerShape(24.dp))
+                        .clip(RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
+                        .background(Color(0xFFFFA000).copy(alpha = 0.15f))
+                        .border(1.dp, Color(0xFFFFA000).copy(alpha = 0.5f), RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
                         .clickable {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             onShowReward()
@@ -14918,7 +16806,7 @@ fun AboutScreen(
                 ) {
                     Text(
                         text = "如果觉得还可以，可以考虑请作者喝一杯柠檬水 🍋(点击我即可)",
-                        color = Color(0xFFFFC107),
+                        color = Color(0xFFFFA000),
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Medium,
                         textAlign = TextAlign.Center
@@ -14942,7 +16830,7 @@ fun RewardDialog(onClose: () -> Unit) {
         Column(
             modifier = Modifier
                 .padding(horizontal = 40.dp)
-                .clip(RoundedCornerShape(20.dp))
+                .clip(RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
                 .background(Color.White)
                 .clickable(enabled = false) { }
                 .padding(24.dp),
@@ -14954,13 +16842,13 @@ fun RewardDialog(onClose: () -> Unit) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .aspectRatio(1f)
-                    .clip(RoundedCornerShape(12.dp)),
+                    .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp)),
                 contentScale = ContentScale.Fit
             )
             Spacer(modifier = Modifier.height(16.dp))
             Text(
                 text = "长按识别赞赏码",
-                color = Color(0xFF333333),
+                color = UiColor.Ink,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Medium
             )
@@ -14969,8 +16857,8 @@ fun RewardDialog(onClose: () -> Unit) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(42.dp)
-                    .clip(RoundedCornerShape(21.dp))
-                    .background(Color(0xFFFFC107))
+                    .clip(RoundedCornerShape(MENU_RADIUS_OUTER_DP.dp))
+                    .background(Color(0xFFFFA000))
                     .clickable {
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         onClose()
@@ -14991,14 +16879,14 @@ fun AboutRow(label: String, value: String) {
     ) {
         Text(
             text = label,
-            color = Color.White.copy(alpha = 0.5f),
+            color = UiColor.TextDim,
             fontSize = 13.sp,
             // 宽度要放得下最长的标签 "b站/抖音"，并让各行内容左对齐
             modifier = Modifier.width(72.dp)
         )
         Text(
             text = value,
-            color = Color.White,
+            color = UiColor.Ink,
             fontSize = 13.sp,
             fontWeight = FontWeight.Medium
         )
@@ -15016,7 +16904,17 @@ private data class OssItem(
     val license: String,
     /** 一句白话说明这个许可证大概允许什么，方便非法律专业的人看懂 */
     val summary: String,
-    val url: String
+    val url: String,
+    /** ★原作者★：用户协议第 4 条要求「标明原作者」 */
+    val author: String = "",
+    /**
+     * ★仅参考视觉配方 / 设计思路，未引入任何依赖★
+     *
+     * 这类项目没有一行代码编译进 APK，写成「本软件使用了」是不准确的。
+     * 仍列出原作者、出处和许可证，是为了兑现协议第 4 条的署名承诺，
+     * 同时让使用者清楚哪些许可证真的约束再分发、哪些只是出处说明。
+     */
+    val referenceOnly: Boolean = false
 )
 
 //
@@ -15064,33 +16962,80 @@ private val OSS_PROJECT_LICENSE_POINTS = listOf(
 )
 
 /**
- * 本项目用到的第三方开源组件。
- * 许可证名称按各项目官方 LICENSE 如实填写。
+ * 本项目的【编译依赖】与【视觉配方参考出处】。
+ *
+ * 用户协议第 4 条：「此软件使用的开源代码在软件内均有标明原作者、
+ * 出处以及开源协议使用许可证」。所以每条都带 author + url + license。
+ *
+ * ⚠️ 后 5 条标 referenceOnly = true：只参考了它们的材质配方 / 设计思路，
+ *    工程是零第三方模糊依赖的（全文无 hazeSource / RenderEffect /
+ *    saveLayer），没有一行代码进 APK。列出来是署名与出处说明，不代表
+ *    再分发时受这些许可证约束；真正的约束只来自前 5 条编译依赖与本项目 MIT。
+ *
+ * 许可证名称按各项目官方 LICENSE / Maven POM 如实填写。
  */
 private val OSS_ITEMS = listOf(
+    // ── ① 真正编译进 APK 的依赖 ──
     OssItem(
-        "Jetpack Compose", "Apache-2.0", "可商用，保留声明即可",
-        "https://github.com/androidx/androidx"
+        name = "Jetpack Compose", license = "Apache-2.0",
+        summary = "可商用，保留声明即可",
+        url = "https://github.com/androidx/androidx",
+        author = "Google / Android Open Source Project"
     ),
     OssItem(
-        "CameraX (androidx.camera)", "Apache-2.0", "可商用，保留声明即可",
-        "https://source.android.com/docs/core/camera/camerax"
+        name = "CameraX (androidx.camera)", license = "Apache-2.0",
+        summary = "可商用，保留声明即可",
+        url = "https://source.android.com/docs/core/camera/camerax",
+        author = "Google / Android Open Source Project"
     ),
     OssItem(
-        "Kotlin", "Apache-2.0", "可商用，保留声明即可",
-        "https://github.com/JetBrains/kotlin"
+        name = "Kotlin", license = "Apache-2.0",
+        summary = "可商用，保留声明即可",
+        url = "https://github.com/JetBrains/kotlin",
+        author = "JetBrains"
     ),
     OssItem(
-        "Android Gradle Plugin", "Apache-2.0", "可商用，保留声明即可",
-        "https://developer.android.com/build"
+        name = "Android Gradle Plugin", license = "Apache-2.0",
+        summary = "可商用，保留声明即可",
+        url = "https://developer.android.com/build",
+        author = "Google / Android Open Source Project"
     ),
     OssItem(
-        "Material Components / Icons", "Apache-2.0", "可商用，保留声明即可",
-        "https://github.com/material-components/material-components-android"
+        name = "Material Components / Icons", license = "Apache-2.0",
+        summary = "可商用，保留声明即可",
+        url = "https://github.com/material-components/material-components-android",
+        author = "Google / Android Open Source Project"
+    ),
+    // ── ② 仅参考视觉配方 / 设计思路，未引入依赖 ──
+    OssItem(
+        name = "AndroidLiquidGlass", license = "Apache-2.0",
+        summary = "仅参考边缘高光与零离屏缓冲的降级思路",
+        url = "https://github.com/Kyant0/AndroidLiquidGlass",
+        author = "Kyant0", referenceOnly = true
     ),
     OssItem(
-        "AndroidLiquidGlass (Kyant0)", "Apache-2.0", "可商用，保留声明即可",
-        "https://github.com/Kyant0/AndroidLiquidGlass"
+        name = "Haze (GlassStyle.regular / clear)", license = "Apache-2.0",
+        summary = "仅参考分级 blur、tint 与 specular rim 的视觉配方",
+        url = "https://github.com/chrisbanes/haze",
+        author = "Chris Banes", referenceOnly = true
+    ),
+    OssItem(
+        name = "LiquidGlass (iOS 26 风格)", license = "Apache-2.0",
+        summary = "仅参考 Full / Medium / Fallback 三档材质参数",
+        url = "https://github.com/NadeemIqbal/liquid-glass",
+        author = "Nadeem Iqbal", referenceOnly = true
+    ),
+    OssItem(
+        name = "ComposeGlassmorphism", license = "MIT",
+        summary = "仅参考单层细描边 + 半透明底的玻璃配方",
+        url = "https://github.com/Deiivid/Glassmorphism-Compose",
+        author = "David Navarro", referenceOnly = true
+    ),
+    OssItem(
+        name = "Fluent Design · Acrylic", license = "设计规范（非代码库）",
+        summary = "仅参考 TintColor / TintOpacity / 明度混合的分层配方",
+        url = "https://learn.microsoft.com/en-us/windows/apps/design/style/acrylic",
+        author = "Microsoft", referenceOnly = true
     )
 )
 
@@ -15103,27 +17048,27 @@ fun OssLicenseEntry(onOpen: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(Color.White.copy(alpha = 0.06f))
+            .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+            .background(UiColor.Wash)
             .clickable { onOpen() }
-            .padding(horizontal = 14.dp, vertical = 12.dp),
+            .padding(horizontal = MENU_EDGE_DP.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = "开源使用许可",
-                color = Color.White,
+                color = UiColor.Ink,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.Medium
             )
-            Spacer(modifier = Modifier.height(3.dp))
+            Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = "本项目及第三方组件的许可证与出处",
-                color = Color.White.copy(alpha = 0.45f),
+                color = UiColor.TextDim,
                 fontSize = 11.sp
             )
         }
-        Text(text = "›", color = Color.White.copy(alpha = 0.5f), fontSize = 18.sp)
+        Text(text = "›", color = UiColor.TextDim, fontSize = 18.sp)
     }
 }
 
@@ -15157,7 +17102,7 @@ fun OssLicenseScreen(onClose: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF0D0D0D))
+            .background(UiColor.Surface)
     ) {
         // ── 顶部返回栏 ──
         Row(
@@ -15171,19 +17116,19 @@ fun OssLicenseScreen(onClose: () -> Unit) {
                 modifier = Modifier
                     .size(40.dp)
                     .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.1f))
+                    .background(UiColor.Wash)
                     .clickable {
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         onClose()
                     },
                 contentAlignment = Alignment.Center
             ) {
-                Text("←", color = Color.White, fontSize = 20.sp)
+                Text("←", color = UiColor.Ink, fontSize = 20.sp)
             }
             Spacer(modifier = Modifier.width(16.dp))
             Text(
                 "开源使用许可",
-                color = Color.White,
+                color = UiColor.Ink,
                 fontSize = 20.sp,
                 fontWeight = FontWeight.Bold
             )
@@ -15205,34 +17150,34 @@ fun OssLicenseScreen(onClose: () -> Unit) {
             //
             Text(
                 text = "本项目",
-                color = Color.White.copy(alpha = 0.45f),
+                color = UiColor.TextDim,
                 fontSize = 12.sp
             )
-            Spacer(modifier = Modifier.height(6.dp))
+            Spacer(modifier = Modifier.height(8.dp))
             Text(
                 text = OSS_PROJECT_NAME,
-                color = Color.White,
+                color = UiColor.Ink,
                 fontSize = 22.sp,
                 fontWeight = FontWeight.Bold
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = OSS_PROJECT_COPYRIGHT,
-                color = Color.White.copy(alpha = 0.5f),
+                color = UiColor.TextDim,
                 fontSize = 12.sp
             )
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(6.dp))
-                        .background(Color(0xFFFFC107).copy(alpha = 0.16f))
+                        .background(Color(0xFFFFA000).copy(alpha = 0.16f))
                         .padding(horizontal = 10.dp, vertical = 5.dp)
                 ) {
                     Text(
                         text = OSS_PROJECT_LICENSE,
-                        color = Color(0xFFFFC107),
+                        color = Color(0xFFFFA000),
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium
                     )
@@ -15240,7 +17185,7 @@ fun OssLicenseScreen(onClose: () -> Unit) {
                 Spacer(modifier = Modifier.width(10.dp))
                 Text(
                     text = "查看许可证全文 ↗",
-                    color = Color.White.copy(alpha = 0.55f),
+                    color = UiColor.TextDim,
                     fontSize = 12.sp,
                     modifier = Modifier.clickable { openUrl(OSS_PROJECT_URL) }
                 )
@@ -15250,14 +17195,14 @@ fun OssLicenseScreen(onClose: () -> Unit) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(Color.White.copy(alpha = 0.05f))
-                    .border(1.dp, Color.White.copy(alpha = 0.08f), RoundedCornerShape(14.dp))
+                    .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                    .background(UiColor.Wash)
+                    .border(1.dp, UiColor.Border, RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
                     .padding(16.dp)
             ) {
                 Text(
                     text = "你可以：",
-                    color = Color.White.copy(alpha = 0.85f),
+                    color = UiColor.Ink,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium
                 )
@@ -15266,12 +17211,12 @@ fun OssLicenseScreen(onClose: () -> Unit) {
                     Row(modifier = Modifier.padding(vertical = 3.dp)) {
                         Text(
                             text = "· ",
-                            color = Color.White.copy(alpha = 0.4f),
+                            color = UiColor.TextFaint,
                             fontSize = 12.sp
                         )
                         Text(
                             text = p,
-                            color = Color.White.copy(alpha = 0.6f),
+                            color = UiColor.TextDim,
                             fontSize = 12.sp,
                             lineHeight = 18.sp,
                             modifier = Modifier.weight(1f)
@@ -15285,55 +17230,67 @@ fun OssLicenseScreen(onClose: () -> Unit) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(1.dp)
-                    .background(Color.White.copy(alpha = 0.10f))
+                    .background(UiColor.Line)
             )
             Spacer(modifier = Modifier.height(18.dp))
 
-            // ② 第三方组件
+            // ② 编译依赖 + 视觉配方参考
             Text(
-                text = "第三方开源组件",
-                color = Color.White,
+                text = "开源组件与设计参考",
+                color = UiColor.Ink,
                 fontSize = 16.sp,
                 fontWeight = FontWeight.Bold
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
-                text = "本软件使用了以下开源项目。这些许可证与本项目（${OSS_PROJECT_LICENSE}）"
-                        + "相互独立、各自生效，不因本项目采用 ${OSS_PROJECT_LICENSE} 而改变。",
-                color = Color.White.copy(alpha = 0.45f),
+                text = "以下条目均标明原作者、出处与许可证。标注「仅参考视觉配方」"
+                        + "的项目未引入任何依赖，其许可证仅作出处说明；真正编译进本软件的"
+                        + "依赖与本项目（${OSS_PROJECT_LICENSE}）的许可证相互独立、各自生效，"
+                        + "不因本项目采用 ${OSS_PROJECT_LICENSE} 而改变。",
+                color = UiColor.TextDim,
                 fontSize = 12.sp,
                 lineHeight = 18.sp
             )
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
             OSS_ITEMS.forEach { item ->
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color.White.copy(alpha = 0.05f))
+                        .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                        .background(UiColor.Wash)
                         .clickable { openUrl(item.url) }
-                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                        .padding(horizontal = MENU_EDGE_DP.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = item.name,
-                            color = Color.White,
+                            color = UiColor.Ink,
                             fontSize = 14.sp
                         )
-                        Spacer(modifier = Modifier.height(3.dp))
+                        Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = "${item.license} · ${item.summary}",
-                            color = Color.White.copy(alpha = 0.45f),
-                            fontSize = 11.sp
+                            text = buildString {
+                                if (item.author.isNotBlank()) {
+                                    append(item.author).append(" · ")
+                                }
+                                append(item.license).append(" · ")
+                                append(
+                                    if (item.referenceOnly) "仅参考视觉配方，未引入依赖"
+                                    else item.summary
+                                )
+                            },
+                            color = UiColor.TextDim,
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp
                         )
                     }
                     // 外链图标用文本 ↗：Icons.AutoMirrored.Filled.OpenInNew
                     // 在 material-icons-extended 里，很多工程没引会编译失败
                     Text(
                         text = "↗",
-                        color = Color.White.copy(alpha = 0.45f),
+                        color = UiColor.TextDim,
                         fontSize = 13.sp
                     )
                 }
@@ -15342,12 +17299,13 @@ fun OssLicenseScreen(onClose: () -> Unit) {
 
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "以上许可证名称按各项目官方 LICENSE 如实填写，完整条款以各自仓库中的 LICENSE 文件为准。",
-                color = Color.White.copy(alpha = 0.35f),
+                text = "以上许可证名称按各项目官方 LICENSE / Maven POM 如实填写，"
+                        + "完整条款以各自仓库中的 LICENSE 文件为准；设计规范类条目不构成代码依赖。",
+                color = UiColor.TextFaint,
                 fontSize = 11.sp,
                 lineHeight = 17.sp
             )
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(12.dp))
             //
             // MIT 的唯一实质义务就是"保留版权声明"，这里原样展示它，
             // 既是合规要求，也让使用者知道署名该怎么写。
@@ -15355,19 +17313,19 @@ fun OssLicenseScreen(onClose: () -> Unit) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(Color.White.copy(alpha = 0.04f))
+                    .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                    .background(UiColor.Wash)
                     .padding(14.dp)
             ) {
                 Text(
                     text = "本项目版权声明（${OSS_PROJECT_LICENSE} 要求保留）",
-                    color = Color.White.copy(alpha = 0.5f),
+                    color = UiColor.TextDim,
                     fontSize = 11.sp
                 )
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = OSS_PROJECT_COPYRIGHT,
-                    color = Color.White.copy(alpha = 0.75f),
+                    color = UiColor.Ink,
                     fontSize = 12.sp,
                     lineHeight = 18.sp
                 )
@@ -15418,14 +17376,11 @@ private fun ShutterButton(
     onPhotoClick: () -> Unit,
     landscape: Boolean = false
 ) {
-    // 录像模式（且未在录制）用缩小版；拍照模式 / 录制中保持原尺寸
-    val shrink: Boolean = isVideoMode && !isRecording
-    val outer: Dp = when {
-        shrink && landscape -> 60.dp
-        shrink -> 64.dp
-        landscape -> 68.dp
-        else -> 76.dp
-    }
+    // ★修复 Bug2★：外径不随模式变化。原来 60/64/68/76 四档，
+    // 底部 Row 按最高子项重新定高，切模式时整行上下跳。统一 72dp 后
+    // 拍照 / 录像 / 专业 / 星空下三键中心线完全不动。
+    // landscape 参数保留（调用点不用改），只不再影响尺寸。
+    val outer: Dp = 72.dp
     //
     // ⚠️ 原来这里的 .background(Color.White) + .border(...) 和"录像红点"都删掉了 ——
     //    白色圆环与内芯现在由 ic_shutter_photo / ic_shutter_video 两个矢量图标提供，
@@ -15476,14 +17431,29 @@ private fun ModeItem(
     vertical: Boolean,
     onSelect: (CaptureMode) -> Unit,
     /** 文字旋转角。竖排模式下外层已整列旋转，这里要传 0f，否则会转两次 */
-    textRotation: Float = LocalLabelRotation.current
+    textRotation: Float = LocalLabelRotation.current,
+    /**
+     * ★整条模式栏的居中平移量（单位：dp 数值）★
+     *
+     * ⚠️ 这里【不能】声明成 State<Float>：调用点传的 shift 是
+     *    Animatable<Float, AnimationVector1D>，它只有 .value 属性，
+     *    【并不实现 State<T> 接口】—— 上一版直接传报了 2 条
+     *    "Argument type mismatch: actual type is Animatable"。
+     *
+     * 改成最基础的 Kotlin 函数类型 () -> Float：
+     *    · 零新 import、不依赖 Animatable.asState() 扩展（版本有无不定）
+     *    · 只在 graphicsLayer 的【延迟 lambda】里调用，弹簧每帧只
+     *      invalidate 这一层，不触发 ModeSelector 整树重组
+     *    · 不参与测量，快门 / 相册行高度不变
+     */
+    centerShift: () -> Float = { 0f }
 ) {
     val haptic = LocalHapticFeedback.current
 
     val textColor by animateColorAsState(
         targetValue = when {
             selected -> Color(0xFFFFA000)
-            else -> Color.White.copy(alpha = 0.75f)
+            else -> UiColor.PreviewTextDim
         },
         animationSpec = tween(durationMillis = 250),
         label = "modeTextColor"
@@ -15499,7 +17469,19 @@ private fun ModeItem(
     val src = remember { MutableInteractionSource() }
     Box(
         modifier = Modifier
+            // ★★位置平移：四个名字整体滑动，选中项落到模式栏中央★★
+            // 放在 bouncyPress 之外：按下缩放与整条位移互不干扰；
+            // graphicsLayer 的 lambda 是延迟读取，动画每帧不触发整树重组。
+            .graphicsLayer {
+                // ★延迟读★：动画每帧只重绘这一层，零重组
+                // 直接乘 density（GraphicsLayerScope 本身就是 Density），
+                // 不写 Float.dp.toPx()：全文没有 Float.dp 的先例，这样最稳。
+                val shiftPx: Float = centerShift() * density
+                if (vertical) translationY = shiftPx
+                else translationX = shiftPx
+            }
             .bouncyPress(src, pressed = 0.90f)
+            .touchRipple(src)
             .clickable(
                 interactionSource = src,
                 indication = null
@@ -15507,11 +17489,10 @@ private fun ModeItem(
                 haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                 onSelect(m)
             }
-            .padding(vertical = 4.dp, horizontal = 4.dp)
-            .background(
-                color = if (vertical) Color.Black.copy(alpha = 0.35f) else Color.Transparent,
-                shape = RoundedCornerShape(10.dp)
-            ),
+            // ★★模式文字去掉背景★★
+            // 和参数栏 chip 一致：白字直接浮在取景画面上，不再垫白底圆角块。
+            // 选中项仍靠橙字 + 橙色下划线区分（唯一强调色）。
+            .padding(vertical = 4.dp, horizontal = 4.dp),
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -15541,7 +17522,63 @@ private fun ModeItem(
 }
 
 /**
- * 模式切换栏（拍照 / 专业 / 录像）。
+ * ★★切换模式时，把选中的模式名字移动到模式栏中央★★
+ *
+ * 四个模式名等宽（都是 2 个汉字 + 相同 padding），所以整条只要统一平移
+ * (中间序号 - 选中序号) × 步长，选中的那两个字就正好落在中央。
+ *
+ * ⚠️ 用 graphicsLayer 的 translation 只改【绘制位置】，不参与测量：
+ *    模式栏占的高度 / 宽度不变，快门与相册那一行不会跟着上下跳
+ *    （这条是历史上专门修过的 bug，不能碰布局）。
+ *
+ * 步长 = 单个 item 占位 + 间距：
+ *   · 竖屏横排：14sp×2 字 ≈ 28dp + 左右 padding 8dp + spacedBy 24dp = 60dp
+ *   · 横屏竖排：13sp 文字 + 下划线 + 上下 padding ≈ 32dp + spacedBy 16dp = 48dp
+ * 数字只是视觉居中用，差几 dp 不影响功能；想微调改这两个常量即可。
+ */
+private val MODE_CENTER_STEP_PORTRAIT: Dp = 60.dp
+private val MODE_CENTER_STEP_LANDSCAPE: Dp = 48.dp
+
+/**
+ * ★★弹簧动画参数（替代原来的 tween(320, FastOutSlowInEasing)）★★
+ *
+ * 【阻尼比 = 1f】严格按需求：临界阻尼，起步快、无振荡、干净收住。
+ *
+ * ⚠️ 物理上必须说清：dampingRatio=1 是【临界阻尼】，本身不会过冲，
+ *    所以「到边界后加回弹」不可能是这条弹簧自带的。这里把回弹做成
+ *    【独立的一层】：主弹簧严格 1f 到位（略有超出边界的量），随后用
+ *    一段低阻尼 spring(0.5f) 弹回目标 —— 视觉上就是橡皮筋撞边界。
+ *
+ *    如果你其实想要「整条曲线都带回弹」，把 MODE_SPRING_DAMPING
+ *    改成 0.6f 一行即可（此时 BOUNCE 那层可留着，只是叠加更弹）。
+ *
+ * 【带上松手速度】两路合一：
+ *    · 点击切换 / 连续快速点不同模式 → 用 Animatable.velocity 承接上一代速度，
+ *      不会每次都从静止重新起步；
+ *    · 在模式栏上甩动松手 → VelocityTracker 式的瞬时速度（指数平滑）注入
+ *      spring 的 initialVelocity，甩得越快滑得越冲。
+ *
+ * 【到边界后加回弹】选中项落在第一个(专业)或最后一个(星空)时，
+ *    主段先越过目标 MODE_BOUNCE_DP，再弹回；已经是最外侧还继续甩，
+ *    靠 bounceNonce 单独触发一次同样的回弹（current 不变也能播）。
+ */
+private const val MODE_SPRING_DAMPING = 1f
+private const val MODE_SPRING_STIFFNESS = 400f   // = Spring.StiffnessMedium
+private const val MODE_BOUNCE_DAMPING = 0.5f
+private const val MODE_BOUNCE_STIFFNESS = 200f   // = Spring.StiffnessLow
+/** 撞边界时越过目标的距离（dp） */
+private const val MODE_BOUNCE_DP = 12f
+/** 松手速度上限（dp/s）：防止一甩飞出屏幕 */
+private const val MODE_RELEASE_VELOCITY_CAP = 1600f
+/** 触发「切一格」的最低松手速度（dp/s） */
+private const val MODE_SWIPE_VELOCITY_MIN = 220f
+/** 或者累计拖动超过这个距离（px）也切一格 */
+private const val MODE_SWIPE_DISTANCE_MIN = 28f
+
+/**
+ * 模式切换栏（专业 / 录像 / 拍照 / 星空）。
+ * 选中的名字始终居中；切换用 spring(dampingRatio=1f) + 松手速度，
+ * 撞到两端时橡皮筋回弹。
  * @param vertical 横屏时传 true：竖排到屏幕左边，不再横着堆在底部挡取景
  */
 @Composable
@@ -15550,29 +17587,156 @@ fun ModeSelector(
     onSelect: (CaptureMode) -> Unit,
     vertical: Boolean = false
 ) {
+    val modes: Array<CaptureMode> = CaptureMode.values()
+    val selectedIndex: Int = modes.indexOf(current).coerceAtLeast(0)
+    val step: Dp = if (vertical) MODE_CENTER_STEP_LANDSCAPE else MODE_CENTER_STEP_PORTRAIT
+    // (n-1)/2 = 1.5：4 个模式时，选中项居中需要的整条平移量（dp 数值）
+    val targetShift: Float =
+        (step * ((modes.size - 1) / 2f - selectedIndex.toFloat())).value
+
+    // ★★用 Animatable 而不是 animateDpAsState★★
+    // 只有它能在 animateTo 里传 initialVelocity，也才有 .velocity 可承接上一代速度。
+    // 单位是「dp 数值」的 Float；ModeItem 在 graphicsLayer 里乘 density 换成 px。
+    val shift = remember { Animatable(targetShift) }
+
+    // 纯 holder（不是 State）：手势里写、LaunchedEffect 里读，避免重组时序问题，
+    // 也不引入任何会被取消的队列 / 忙闸门（历史上那次全界面假死的根，绝不重蹈）。
+    val releaseVel: FloatArray = remember { floatArrayOf(0f) }
+    // 撞边界但 current 没变时，也要让动画重播一次回弹
+    val bounceNonce: MutableState<Int> = remember { mutableStateOf(0) }
+    val density = LocalDensity.current
+
+    //
+    // ★★主弹簧：dampingRatio = 1f，带松手速度★★
+    //
+    LaunchedEffect(current, vertical, bounceNonce.value) {
+        // 有甩动速度就用它；否则承接 Animatable 的当前速度（快速连点不每次归零）
+        val v: Float = if (releaseVel[0] != 0f) releaseVel[0] else shift.velocity
+        releaseVel[0] = 0f
+
+        val atBoundary: Boolean = selectedIndex == 0 || selectedIndex == modes.lastIndex
+        // 边界方向：targetShift 在最外侧必为 ±1.5*step，符号就是「继续往外」的方向
+        val dir: Float = if (targetShift >= 0f) 1f else -1f
+        val firstTarget: Float =
+            if (atBoundary) targetShift + dir * MODE_BOUNCE_DP else targetShift
+
+        shift.animateTo(
+            targetValue = firstTarget,
+            animationSpec = spring(
+                dampingRatio = MODE_SPRING_DAMPING,      // 1f，严格按需求
+                stiffness = MODE_SPRING_STIFFNESS
+            ),
+            initialVelocity = v.coerceIn(
+                -MODE_RELEASE_VELOCITY_CAP,
+                MODE_RELEASE_VELOCITY_CAP
+            )
+        )
+        //
+        // ★★到边界后加回弹★★
+        // dampingRatio=1 本身不过冲，这一段独立用低阻尼弹簧弹回目标，
+        // 视觉上就是「冲过边界 → 橡皮筋弹回」。主弹簧参数一个字没改。
+        //
+        if (atBoundary) {
+            shift.animateTo(
+                targetValue = targetShift,
+                animationSpec = spring(
+                    dampingRatio = MODE_BOUNCE_DAMPING,
+                    stiffness = MODE_BOUNCE_STIFFNESS
+                )
+            )
+        }
+    }
+
+    //
+    // ★★松手速度：模式栏上的甩动手势★★
+    //
+    // 轻点仍走 ModeItem 自己的 clickable（没超过 touchSlop 时这里不消费事件）；
+    // 只有真正甩动才接管，松手把瞬时速度注入 spring 的 initialVelocity。
+    // 不用 VelocityTracker 以免引新 API，用「位移/时间」指数平滑算速度，
+    // 再按 density 换算成 dp/s。
+    //
+    val swipeMod: Modifier = Modifier.pointerInput(current, vertical) {
+        var velPx = 0f
+        var lastT = 0L
+        var totalPx = 0f
+        detectDragGestures(
+            onDragStart = {
+                velPx = 0f
+                totalPx = 0f
+                lastT = System.currentTimeMillis()
+            },
+            onDragCancel = {
+                velPx = 0f
+                totalPx = 0f
+            },
+            onDragEnd = {
+                val vDp: Float = (velPx / density.density).coerceIn(
+                    -MODE_RELEASE_VELOCITY_CAP,
+                    MODE_RELEASE_VELOCITY_CAP
+                )
+                val fired: Boolean =
+                    abs(totalPx) >= MODE_SWIPE_DISTANCE_MIN ||
+                            abs(vDp) >= MODE_SWIPE_VELOCITY_MIN
+                if (fired) {
+                    // 往左甩 → 整条左移 → 选中项后移一格
+                    val nextIdx: Int =
+                        (selectedIndex + if (totalPx < 0f || vDp < 0f) 1 else -1)
+                            .coerceIn(0, modes.lastIndex)
+                    releaseVel[0] = vDp
+                    if (nextIdx == selectedIndex) {
+                        // 已经在最外侧还往外甩：current 不变，单独触发一次边界回弹
+                        bounceNonce.value++
+                    } else {
+                        onSelect(modes[nextIdx])
+                    }
+                }
+                velPx = 0f
+                totalPx = 0f
+            }
+        ) { _, dragAmount ->
+            // 横屏整列被 rotatedLabel 转过 90°，排列轴在屏幕上也是水平方向，
+            // 所以两个分支统一取 x；若某机型方向相反，把 .x 改 .y 一行即可。
+            val d: Float = dragAmount.x
+            totalPx += d
+            val now = System.currentTimeMillis()
+            val dt: Long = (now - lastT).coerceAtLeast(1L)
+            val instant: Float = d / dt.toFloat() * 1000f
+            velPx = 0.65f * velPx + 0.35f * instant
+            lastT = now
+        }
+    }
+
     if (vertical) {
         // ★竖排时整列旋转★：跟菜单同一个道理 —— 竖排的一列里逐条转文字会互相重叠。
+        // swipeMod 放在 rotatedLabel 【之前】，手势拿到的是屏幕坐标系，不受旋转影响。
+        // 平移仍放在每个 ModeItem 自己的 graphicsLayer 里，不碰布局。
         Column(
-            modifier = Modifier.rotate(LocalLabelRotation.current),
+            modifier = swipeMod.then(Modifier.rotatedLabel()),
             verticalArrangement = Arrangement.spacedBy(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            CaptureMode.values().forEach { m ->
+            modes.forEach { m ->
                 ModeItem(
                     m = m, selected = m == current, vertical = true,
                     onSelect = onSelect,
                     // 整列已经转过了，这里不能再转一次
-                    textRotation = 0f
+                    textRotation = 0f,
+                    centerShift = { shift.value }
                 )
             }
         }
     } else {
         Row(
+            modifier = swipeMod,
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(24.dp)
         ) {
-            CaptureMode.values().forEach { m ->
-                ModeItem(m = m, selected = m == current, vertical = false, onSelect = onSelect)
+            modes.forEach { m ->
+                ModeItem(
+                    m = m, selected = m == current, vertical = false,
+                    onSelect = onSelect,
+                    centerShift = { shift.value }
+                )
             }
         }
     }
@@ -15618,17 +17782,17 @@ fun SessionGallery(media: List<CapturedMedia>, onClose: () -> Unit) {
                 Box(
                     modifier = Modifier
                         .size(40.dp).clip(CircleShape)
-                        .background(Color.White.copy(alpha = 0.15f))
+                        .background(UiColor.Wash)
                         .clickable {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                             onClose()
                         },
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("←", color = Color.White, fontSize = 20.sp)
+                    Text("←", color = UiColor.Ink, fontSize = 20.sp)
                 }
                 Spacer(modifier = Modifier.width(16.dp))
-                Text("本次拍摄 (${media.size})", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text("本次拍摄 (${media.size})", color = UiColor.Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold)
             }
             if (media.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -15659,10 +17823,10 @@ fun SessionGallery(media: List<CapturedMedia>, onClose: () -> Unit) {
                                 Box(
                                     modifier = Modifier
                                         .align(Alignment.BottomEnd).padding(4.dp)
-                                        .background(Color.Black.copy(alpha = 0.6f), CircleShape)
+                                        .background(Color.White.copy(alpha = 0.92f), CircleShape)
                                         .padding(4.dp)
                                 ) {
-                                    Text("▶", color = Color.White, fontSize = 10.sp)
+                                    Text("▶", color = UiColor.Ink, fontSize = 10.sp)
                                 }
                             }
                         }
@@ -15701,7 +17865,7 @@ fun SessionThumbnail(media: CapturedMedia, modifier: Modifier = Modifier) {
     }
     bitmap?.let {
         Image(bitmap = it, contentDescription = null, modifier = modifier, contentScale = ContentScale.Crop)
-    } ?: Box(modifier = modifier.background(Color(0xFF333333)))
+    } ?: Box(modifier = modifier.background(UiColor.SurfaceHi))
 }
 
 // ==================== 变焦 ====================
@@ -15780,15 +17944,7 @@ fun ZoomRuler(
         if (showDialTexture) {
             val dialW = 26.dp.toPx()
             drawArc(
-                brush = Brush.radialGradient(
-                    colors = listOf(
-                        Color.White.copy(alpha = 0.10f),
-                        Color.White.copy(alpha = 0.05f),
-                        Color.Transparent
-                    ),
-                    center = Offset(cX, cY),
-                    radius = R
-                ),
+                brush = SolidColor(Color.White.copy(alpha = 0.16f)),
                 startAngle = 270f - thetaDeg,
                 sweepAngle = thetaDeg * 2f,
                 useCenter = false,
@@ -15797,7 +17953,7 @@ fun ZoomRuler(
                 style = Stroke(width = dialW, cap = StrokeCap.Round)
             )
             drawArc(
-                color = Color.White.copy(alpha = 0.10f),
+                color = Color.White.copy(alpha = 0.28f),
                 startAngle = 270f - thetaDeg,
                 sweepAngle = thetaDeg * 2f,
                 useCenter = false,
@@ -15808,7 +17964,7 @@ fun ZoomRuler(
         }
 
         drawArc(
-            color = Color.White.copy(alpha = 0.4f),
+            color = Color.White.copy(alpha = 0.55f),
             startAngle = 270f - thetaDeg,
             sweepAngle = thetaDeg * 2f,
             useCenter = false,
@@ -15825,7 +17981,7 @@ fun ZoomRuler(
                 val p1 = arcPos(a, R)
                 val p2 = arcPos(a, R - 6.dp.toPx())
                 drawLine(
-                    color = Color.White.copy(alpha = 0.5f),
+                    color = UiColor.TextDim,
                     start = p1, end = p2,
                     strokeWidth = 1.dp.toPx(),
                     cap = StrokeCap.Round
@@ -15850,7 +18006,7 @@ fun ZoomRuler(
                 val p1 = arcPos(a, R)
                 val p2 = arcPos(a, R - 12.dp.toPx())
                 drawLine(
-                    color = Color.White,
+                    color = UiColor.Ink,
                     start = p1, end = p2,
                     strokeWidth = 1.5.dp.toPx(),
                     cap = StrokeCap.Round
@@ -15867,7 +18023,7 @@ fun ZoomRuler(
 
         val arcCenter = arcPos(0f, R)
         drawLine(
-            color = Color(0xFFFFC107),
+            color = Color(0xFFFFA000),
             start = Offset(arcCenter.x, arcCenter.y - 4.dp.toPx()),
             end = Offset(arcCenter.x, arcCenter.y + 18.dp.toPx()),
             strokeWidth = 3.dp.toPx(),
@@ -15907,17 +18063,19 @@ fun ZoomButton(
             .size(size)
             .background(
                 color = when {
-                    !enabled -> Color.Black.copy(alpha = 0.2f)
-                    isSelected -> Color.White
-                    else -> Color.Black.copy(alpha = 0.4f)
+                    !enabled -> Color.White.copy(alpha = 0.55f)
+                    // 选中态：唯一强调色底 + 黑字，白底主题下比「纯白底」更一眼可辨
+                    isSelected -> UiColor.Accent
+                    else -> UiColor.Chrome
                 },
                 shape = CircleShape
             )
             .border(
                 width = 1.dp,
-                color = if (isSelected) Color.Transparent else Color.White.copy(alpha = if (enabled) 0.3f else 0.1f),
+                color = if (isSelected) Color.Transparent else UiColor.GlassLine,
                 shape = CircleShape
             )
+            .touchRipple(interactionSource)
             .clickable(
                 enabled = enabled,
                 interactionSource = interactionSource,
@@ -15929,14 +18087,14 @@ fun ZoomButton(
         Text(
             text = label,
             color = when {
-                !enabled -> Color.White.copy(alpha = 0.25f)
-                isSelected -> Color.Black
-                else -> Color.White
+                !enabled -> UiColor.TextDim
+                isSelected -> UiColor.Ink
+                else -> UiColor.Ink
             },
             fontSize = 13.sp,
             fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
             // ★只旋转文字★
-            modifier = Modifier.rotate(LocalLabelRotation.current)
+            modifier = Modifier.rotatedLabel()
         )
     }
 }
@@ -15993,13 +18151,17 @@ private fun MenuItem(
     val bg = rememberPressColor(
         interactionSource = src,
         normal = Color.Transparent,
-        pressedColor = Color.White.copy(alpha = 0.12f)
+        pressedColor = UiColor.GlassPressed
     )
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            // ★滚动帧率★：每行缓存成独立 layer，滑动时只做位移合成，
+            // 不再整棵子树每帧重绘 —— 设置页长列表滚动明显更跟手。
+            .graphicsLayer()
             .bouncyPress(src, pressed = 0.97f)
             .background(bg)
+            .touchRipple(src)
             .clickable(
                 interactionSource = src,
                 indication = null
@@ -16013,7 +18175,7 @@ private fun MenuItem(
     ) {
         Text(
             text,
-            color = if (selected) Color(0xFFFFC107) else Color.White,
+            color = if (selected) UiColor.Accent else UiColor.Text,
             fontSize = 13.sp,
             fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
             // ★防溢出★：文字过长时省略，绝不顶出菜单栏（以前会往左顶出去）
@@ -16032,13 +18194,13 @@ private fun MenuItem(
             Spacer(Modifier.width(6.dp))
             Text(
                 note,
-                color = Color.White.copy(alpha = 0.45f),
+                color = UiColor.TextDim,
                 fontSize = 10.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
         }
-        if (selected) Text("✓", color = Color(0xFFFFC107), fontSize = 13.sp)
+        if (selected) Text("✓", color = UiColor.Accent, fontSize = 13.sp)
     }
 }
 
@@ -16086,10 +18248,37 @@ private fun MultiLevelMenu(
     onShutterSoundChange: (Boolean) -> Unit = {},
     /** ★左右滑动切换模式★ 当前是否打开 */
     swipeModeOn: Boolean = true,
-    /** 切换 左右滑动切换模式 */
-    onSwipeModeChange: (Boolean) -> Unit = {}
+    /** 左右滑动切换模式 */
+    onSwipeModeChange: (Boolean) -> Unit = {},
+    /**
+     * ★菜单是否正在显示★
+     * 外层 AnimatedVisibility 在 exit 动画期间仍会保留本面板的组合，
+     * 此时 visible=false：冻结内容路径，内部不再播「退回一级」的切页动画。
+     * 有默认值 true，其它调用点（若有）不用改。
+     */
+    visible: Boolean = true
 ) {
     val haptic = LocalHapticFeedback.current
+
+    //
+    // ★★返回动画重复的根因与修法★★
+    //
+    // goBack() 直接把 menuPath 置 null；调用处写的是 path = menuPath ?: ""，
+    // 于是 path 从二级（如「拍摄设置」）瞬间变回 ""：
+    //   · Crossfade(targetState = path) 播 200ms「切回一级」
+    //   · LaunchedEffect(path) 重启，slideX snapTo(-28) → 0 播 220ms「滑回」
+    // 同时外层 AnimatedVisibility 正在播 fadeOut+scaleOut「整个菜单退出」。
+    // 两遍动画叠在一起，看着就是「返回动画重复了一遍」。
+    //
+    // 修法：显示期间把当前 path 记进普通数组（不触发重组），退出期间
+    // 继续用这个冻结值喂给内容 —— 内容完全静止，只剩外层一遍 exit。
+    // 用 remember 而非外层 State：AnimatedVisibility 的 content 在 exit
+    // 结束后会被 dispose，下次打开菜单时它重新以根页 "" 初始化，
+    // Crossfade 首次组合不播动画，不会在「重新打开」时补一次切页。
+    //
+    val frozenPath = remember { arrayOf(path) }
+    if (visible) frozenPath[0] = path
+    val shownPath: String = if (visible) path else frozenPath[0]
     Box(
         modifier = modifier
             // ★整体旋转★：必须放在最外层，让背景 / 边框 / 内容一起转。
@@ -16100,9 +18289,8 @@ private fun MultiLevelMenu(
             // 给一个下限 + 上限，让 Box 按内容取宽度，同时不无限变宽。
             // 上限收到 220dp：旋转 90° 后"高度"会变成"宽度"，太宽会顶出屏幕。
             .widthIn(min = 190.dp, max = 220.dp)
-            .clip(RoundedCornerShape(16.dp))
-            .background(Color.Black.copy(alpha = 0.88f))
-            .border(1.dp, Color.White.copy(alpha = 0.16f), RoundedCornerShape(16.dp))
+            // ★所有面板共用 softGlass★：统一材质、同心圆角、同一左边缘
+            .softGlass(cornerDp = MENU_RADIUS_OUTER_DP, emphasized = true)
             .padding(vertical = 8.dp)
     ) {
         Column(
@@ -16111,6 +18299,10 @@ private fun MultiLevelMenu(
                 // 上限由外层按屏幕高度算好（MENU_MAX_HEIGHT_DP / FRAC 取小），
                 // 旋转 90° 后它会变成面板的"宽度"，太大顶出屏幕。
                 .heightIn(max = maxContentHeight)
+                // ★滚动帧率★：滚动内容整体走 layer 合成 + 裁掉屏外绘制，
+                // 减少每帧的过度绘制，配合 MenuItem 的独立 layer 一起生效。
+                .graphicsLayer()
+                .clipToBounds()
                 .verticalScroll(rememberScrollState())
         ) {
             Row(
@@ -16120,21 +18312,22 @@ private fun MultiLevelMenu(
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                         if (path.isEmpty()) onPathChange(null) else onPathChange("")
                     }
-                    .padding(horizontal = 14.dp, vertical = 6.dp),
+                    .padding(horizontal = MENU_EDGE_DP.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("<", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                Spacer(modifier = Modifier.width(10.dp))
+                Text("<", color = UiColor.Text, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.width(12.dp))
                 Text(
-                    if (path.isEmpty()) "设置" else path,
-                    color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold
+                    if (shownPath.isEmpty()) "设置" else shownPath,
+                    color = UiColor.Text, fontSize = 14.sp, fontWeight = FontWeight.Bold
                 )
             }
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .padding(horizontal = MENU_EDGE_DP.dp)
                     .height(1.dp)
-                    .background(Color.White.copy(alpha = 0.12f))
+                    .background(UiColor.Line)
             )
 
             // 菜单只放【设置栏上没有入口】的项：
@@ -16143,12 +18336,14 @@ private fun MultiLevelMenu(
             val isVideoMode: Boolean = st.mode == CaptureMode.VIDEO
             // barHasHighRes 已删：高像素有 chip，菜单不再重复列，判据无用
             val barHasFlash: Boolean = true
-            val barHasTone: Boolean = true
+            // ★4K 录像的闪光灯在【菜单根页】的 overflow 里，这里不重复列★
+            // ★录像模式无调色盘★：菜单里也不再补「调色盘」兜底项，
+            // 原来那条「参数栏有没有调色入口」的判据与分支整块删除。
 
             // 分类里一项都不剩时，一级菜单就不列这个分类（避免点进去是空页面）
             val showPhotoGroup: Boolean = !isVideoMode
             // "录像设置"一级已删除：画质/帧率/防抖在设置栏能直接改
-            // "其他"恒显示：原写法 !barHasFlash||!barHasTone 恒 false，
+            // "其他"恒显示：原写法 !barHasFlash 恒 false，
             // 这一级从来没出现过，构图辅助线开关等于点不到
             val showOtherGroup: Boolean = true
 
@@ -16159,15 +18354,17 @@ private fun MultiLevelMenu(
             //    现在改成"每次切页先 snapTo 到起点，再 animateTo(0f)"，
             //    动画结束一定回到 0，绝不会停在偏移位置。
             val slideX = remember { Animatable(0f) }
-            LaunchedEffect(path) {
-                slideX.snapTo(if (path.isNotEmpty()) 28f else -28f)
+            // ★以 shownPath 为 key★：退出期间它不变 → 本 effect 不重启，
+            // 不再多播一遍「滑回一级」。进入二级时仍照常播进页动画。
+            LaunchedEffect(shownPath) {
+                slideX.snapTo(if (shownPath.isNotEmpty()) 28f else -28f)
                 slideX.animateTo(0f, tween(durationMillis = 220))
             }
             Crossfade(
-                targetState = path,
+                targetState = shownPath,
                 animationSpec = tween(durationMillis = 200)
             ) { cur ->
-                Column(modifier = Modifier.offset(x = slideX.value.dp)) {
+                Column(modifier = Modifier.offset(x = slideX.value.dp).graphicsLayer()) {
                     when (cur) {
                         "" -> {
                             if (showPhotoGroup) MenuItem("拍摄设置") { onPathChange("拍摄设置") }
@@ -16193,27 +18390,32 @@ private fun MultiLevelMenu(
                             }
                         }
                         "拍摄设置" -> {
-                            // 与录像模式同规则：设置栏能直接改的（高像素 CHIP_HIGH_RES、
-                            // 各比例 chip）不再重复列；下面几项设置栏上没有入口，必须留。
-                            // 不支持 RAW 的机器点了会弹 Toast，这里不额外占位。
-                            MenuItem(
-                                if (st.rawEnabled) "格式：RAW" else "格式：JPEG",
-                                selected = st.rawEnabled,
-                                note = "此功能为测试功能"
-                            ) { act.onRawToggle() }
-                            // 强制 RAW：只在检测为"不支持"时出现，给误判的机器留逃生门。
-                            // 真不行会自动退回 JPEG，不会崩。
-                            if (st.rawSupported == false) {
+                            // ★★渐进式披露★★：RAW 全是「测试功能」，普通用户根本用不到，
+                            // 默认收起来；只有主动点「高级 · 测试功能」才展开。
+                            DisclosureSection(
+                                title = "高级 · 测试功能",
+                                collapsedLabel = "展开"
+                            ) {
+                                // 不支持 RAW 的机器点了会弹 Toast，这里不额外占位。
                                 MenuItem(
-                                    if (st.rawForce) "强制 RAW：开" else "强制 RAW：关",
-                                    selected = st.rawForce
-                                ) { act.onRawForceToggle() }
+                                    if (st.rawEnabled) "格式：RAW" else "格式：JPEG",
+                                    selected = st.rawEnabled,
+                                    note = "此功能为测试功能"
+                                ) { act.onRawToggle() }
+                                // 强制 RAW：只在检测为"不支持"时出现，给误判的机器留逃生门。
+                                // 真不行会自动退回 JPEG，不会崩。
+                                if (st.rawSupported == false) {
+                                    MenuItem(
+                                        if (st.rawForce) "强制 RAW：开" else "强制 RAW：关",
+                                        selected = st.rawForce
+                                    ) { act.onRawForceToggle() }
+                                }
+                                // 开 = 只保存 DNG（小米默认，路径最稳）；关 = DNG + JPEG
+                                MenuItem(
+                                    if (st.rawSingleOutput) "RAW 输出：仅DNG" else "RAW 输出：DNG+JPEG",
+                                    selected = st.rawSingleOutput
+                                ) { act.onRawSingleToggle() }
                             }
-                            // 开 = 只保存 DNG（小米默认，路径最稳）；关 = DNG + JPEG
-                            MenuItem(
-                                if (st.rawSingleOutput) "RAW 输出：仅DNG" else "RAW 输出：DNG+JPEG",
-                                selected = st.rawSingleOutput
-                            ) { act.onRawSingleToggle() }
                         }
                         "其他" -> {
                             // ★「自动旋转」菜单项已随旋转按键一起移除★
@@ -16230,40 +18432,36 @@ private fun MultiLevelMenu(
                             // ⚠️ 这里只是【开关】，"当前 UI 藏没藏"是另一个瞬时状态，
                             //    由双击切换，不进菜单也不持久化。
                             //
-                            MenuItem(
-                                if (uiHideEnabled) "UI隐藏：开" else "UI隐藏：关",
-                                selected = uiHideEnabled
-                            ) { onUiHideChange(!uiHideEnabled) }
-                            //
-                            // ★快门声★
-                            //   开：拍照时播放系统快门音（跟原厂相机同一个音）
-                            //   关：完全静音
-                            //   ⚠️ 部分 ROM 按法规强制快门声，那种机器上关了也还是会响 ——
-                            //      这是系统行为，App 层面改不了。
-                            //
-                            MenuItem(
-                                if (shutterSoundOn) "快门声：开" else "快门声：关",
-                                selected = shutterSoundOn
-                            ) { onShutterSoundChange(!shutterSoundOn) }
-                            //
-                            // ★左右滑动切换模式★
-                            //   开：在取景画面上左右滑动即可切换 拍照 / 录像 / 专业 / 星空
-                            //   关：滑动不生效（想要避免误触就关掉）
-                            //
-                            MenuItem(
-                                if (swipeModeOn) "滑动切模式：开" else "滑动切模式：关",
-                                selected = swipeModeOn
-                            ) { onSwipeModeChange(!swipeModeOn) }
-                            if (!barHasFlash) {
-                                MenuItem("闪光灯") {
-                                    act.onFlashExpand()
-                                    onPathChange(null)
-                                }
-                            }
-                            if (!barHasTone) {
-                                MenuItem("调色盘") {
-                                    act.onColorPalette()
-                                    onPathChange(null)
+                            DisclosureSection(title = "更多设置") {
+                                MenuItem(
+                                    if (uiHideEnabled) "UI隐藏：开" else "UI隐藏：关",
+                                    selected = uiHideEnabled
+                                ) { onUiHideChange(!uiHideEnabled) }
+                                //
+                                // ★快门声★
+                                //   开：拍照时播放系统快门音（跟原厂相机同一个音）
+                                //   关：完全静音
+                                //   ⚠️ 部分 ROM 按法规强制快门声，那种机器上关了也还是会响 ——
+                                //      这是系统行为，App 层面改不了。
+                                //
+                                MenuItem(
+                                    if (shutterSoundOn) "快门声：开" else "快门声：关",
+                                    selected = shutterSoundOn
+                                ) { onShutterSoundChange(!shutterSoundOn) }
+                                //
+                                // ★左右滑动切换模式★
+                                //   开：在取景画面上左右滑动即可切换 拍照 / 录像 / 专业 / 星空
+                                //   关：滑动不生效（想要避免误触就关掉）
+                                //
+                                MenuItem(
+                                    if (swipeModeOn) "滑动切模式：开" else "滑动切模式：关",
+                                    selected = swipeModeOn
+                                ) { onSwipeModeChange(!swipeModeOn) }
+                                if (!barHasFlash) {
+                                    MenuItem("闪光灯") {
+                                        act.onFlashExpand()
+                                        onPathChange(null)
+                                    }
                                 }
                             }
                         }
@@ -16278,8 +18476,9 @@ private fun MultiLevelMenu(
  * ★苹果风格调色盘★
  * 横轴 = 色温（左冷右暖），纵轴 = 色调（上绿下洋红），下面一条强度滑条。
  *
- * 取景时预览会套上近似的色调（[CameraApp] 里的 toneOverlayColor），
- * 成片由拍照后处理（postProcessPhoto）套用同一组增益，所以所见即所得。
+ * 取景画面不做绘制层调色（会与 SurfaceView 透明洞冲突导致黑屏）；
+ * 成片由 postProcessPhoto 套用同一组 toneGains 增益，面板里另有
+ * 「当前影调」色块实时反馈。★仅拍照 / 专业 / 星空可用，录像模式不提供入口★。
  */
 /**
  * ★苹果柔光玻璃材质★
@@ -16292,21 +18491,9 @@ private fun MultiLevelMenu(
  * ⚠️ 刻意不用 Modifier.blur()：那是 Android 12(API 31) 才真正生效的 RenderEffect，
  *    低版本上是 no-op（还会打警告），而相机预览本身在动，玻璃后面透出画面就有"毛玻璃"感。
  */
-/** 苹果柔光玻璃的白色渐变层（纯计算，不需要 Composable 上下文） */
-private fun appleGlassBrush(): Brush = Brush.verticalGradient(
-    //
-    // ★已按"面板底 0.82"重新配平★
-    //   原来是 0.20/0.11/0.06/0.09，是配 0.42 浅底用的。
-    //   底色加深到 0.82 后，这些白色会把面板又提亮回去、把暗底冲掉，
-    //   所以整体压到约原来的一半，只保留玻璃的"厚度感"。
-    //
-    colors = listOf(
-        Color.White.copy(alpha = 0.10f),
-        Color.White.copy(alpha = 0.05f),
-        Color.White.copy(alpha = 0.03f),
-        Color.White.copy(alpha = 0.045f)
-    )
-)
+/** ★柔光玻璃的透光层★（纯计算，不需要 Composable 上下文）
+ *  纯色不使用渐变/发光，只给玻璃加一层极淡的通透感。 */
+private fun appleGlassBrush(): Brush = SolidColor(UiColor.GlassSheen)
 
 /**
  * ★影调预设★
@@ -16480,41 +18667,35 @@ fun AppleColorPalette(
             Column(
                 modifier = (if (landscape) {
                     Modifier
-                        .width(230.dp)
+                        .width(200.dp)
                         .heightIn(max = panelMaxH)
                         .verticalScroll(rememberScrollState())
                         .padding(end = 10.dp)
                 } else {
                     Modifier
-                        .fillMaxWidth(0.82f)
+                        // ★体积做小一点★：82% → 68%
+                        .fillMaxWidth(0.68f)
                         .heightIn(max = panelMaxH)
                         // ★「完成」往上抬★：底部留白从 12dp 加到 52dp，
                         // 整个面板离屏幕底边远一点，"完成"就不会贴着边缘、
                         // 也不会压在手势导航条上（全面屏机型尤其明显）
                         .padding(start = 12.dp, top = 12.dp, end = 12.dp, bottom = 52.dp)
                 })
-                    // ③ 玻璃底：半透明黑打底
-                    //    ★★加深：0.42 → 0.82★★
-                    //    原来的 0.42 太透，面板里的滑条、数值、按钮跟背后的
-                    //    取景画面糊在一起，边界和文字都看不清。
-                    //    0.82 实测在亮画面（天空、雪地）和暗画面下都能读清，
-                    //    同时仍保留一点"玻璃"的通透感（不是纯黑实心块）。
-                    //    想更暗改 0.90，想更透改 0.70。
-                    .clip(RoundedCornerShape(26.dp))
-                    .background(Color.Black.copy(alpha = 0.82f))
-                    // ② 玻璃层：白色竖向渐变（已按加深后的底色重新压低亮度）
+                    // ③ 透明亚克力底：明度混合层 + TintColor
+                    //    浓度见 UiColor.Glass / ACRYLIC_* 常量；
+                    //    明度层保证滑条、数值、按钮在亮画面下仍读得清。
+                    // ★与下方唯一一层 border 同心，且只套一层边框★
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(UiColor.AcrylicDim)
+                    .background(UiColor.Glass)
+                    // ② 柔光透光层：纯色，不用渐变 / 发光
                     .background(brush = appleGlassBrush())
                     // ① 高光边：苹果玻璃最标志性的那道顶边 + 一圈极淡描边
+                    // ★边框只套一层，且不用渐变/发光★
                     .border(
                         width = 1.dp,
-                        brush = Brush.verticalGradient(
-                            colors = listOf(
-                                Color.White.copy(alpha = 0.45f),
-                                Color.White.copy(alpha = 0.10f),
-                                Color.White.copy(alpha = 0.16f)
-                            )
-                        ),
-                        shape = RoundedCornerShape(26.dp)
+                        color = UiColor.GlassLine,
+                        shape = RoundedCornerShape(16.dp)
                     )
                     .clickable(
                         indication = null,
@@ -16529,7 +18710,7 @@ fun AppleColorPalette(
                 ) {
                     Text(
                         "调色",
-                        color = Color.White,
+                        color = UiColor.Ink,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Bold
                     )
@@ -16537,34 +18718,71 @@ fun AppleColorPalette(
                     // ★测试功能标注★：小字、低透明度，不抢主标题
                     Text(
                         "此功能为测试功能",
-                        color = Color.White.copy(alpha = 0.45f),
+                        color = UiColor.TextFaint,
                         fontSize = 10.sp
                     )
                     Spacer(modifier = Modifier.weight(1f))
                     Text(
                         "复位",
-                        color = Color.White.copy(alpha = 0.7f),
+                        color = UiColor.TextDim,
                         fontSize = 12.sp,
                         modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color.White.copy(alpha = 0.14f))
+                            .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                            .background(UiColor.GlassPressed)
                             .clickable { onReset() }
                             .padding(horizontal = 10.dp, vertical = 4.dp)
                     )
                 }
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // ── ★当前影调：成片会偏成的颜色★ ──
+                // 取景画面不做绘制层调色（会与 SurfaceView 打洞冲突导致黑屏），
+                // 所以把「当前选中点作用后的中性灰」直接摆在这里给用户看。
+                // 与成片 postProcessPhoto、盘面共用同一个 toneGains，方向严格一致。
+                val currentTone = toneGains(warmth, tint, intensity)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(28.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(
+                                Color(
+                                    red = (0.5f * currentTone[0]).coerceIn(0f, 1f),
+                                    green = (0.5f * currentTone[1]).coerceIn(0f, 1f),
+                                    blue = (0.5f * currentTone[2]).coerceIn(0f, 1f)
+                                )
+                            )
+                            .border(
+                                1.dp,
+                                UiColor.Border,
+                                RoundedCornerShape(6.dp)
+                            )
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        "当前影调（成片效果）",
+                        color = UiColor.TextDim,
+                        fontSize = 11.sp
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
 
                 // ── 二维调色盘（扁盘，不再占满整屏）──
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        // 横屏也用 1.55（更扁），把高度让给下面新增的影调行
-                        .aspectRatio(1.55f)
-                        .clip(RoundedCornerShape(16.dp))
+                        // ★盘面更扁，整体更省纵向空间★
+                        .aspectRatio(1.9f)
+                        // ★嵌套同心★：外面板 16 / 内边距 12 → 内圆角取令牌里最接近的 6
+                        // 内圆角明显小于外圆角，两层圆心自然对齐；边框仍只套一层
+                        .clip(RoundedCornerShape(6.dp))
                         .border(
                             width = 1.dp,
-                            color = Color.White.copy(alpha = 0.22f),
-                            shape = RoundedCornerShape(16.dp)
+                            color = UiColor.Border,
+                            shape = RoundedCornerShape(6.dp)
                         )
                         .pointerInput(Unit) {
                             detectDragGestures { change, _ ->
@@ -16611,19 +18829,9 @@ fun AppleColorPalette(
 
                         // ★柔光玻璃质感★：盘面上覆一层顶部亮、底部暗的柔和光晕，
                         // 再叠一道顶部高光 —— 就是 iOS 调色盘那种"光从上方打过来"的感觉
-                        drawRect(
-                            brush = Brush.verticalGradient(
-                                colors = listOf(
-                                    Color.White.copy(alpha = 0.16f),
-                                    Color.White.copy(alpha = 0.03f),
-                                    Color.Black.copy(alpha = 0.06f)
-                                ),
-                                startY = 0f,
-                                endY = h
-                            )
-                        )
+                        drawRect(color = Color.Black.copy(alpha = 0.04f))
                         drawLine(
-                            color = Color.White.copy(alpha = 0.35f),
+                            color = Color.Black.copy(alpha = 0.35f),
                             start = Offset(0f, 1.dp.toPx()),
                             end = Offset(w, 1.dp.toPx()),
                             strokeWidth = 1.dp.toPx()
@@ -16634,13 +18842,13 @@ fun AppleColorPalette(
                         //   专业调色盘都有，用来判断"偏了多少"。
                         //
                         drawLine(
-                            color = Color.White.copy(alpha = 0.18f),
+                            color = Color.Black.copy(alpha = 0.18f),
                             start = Offset(w / 2f, 0f),
                             end = Offset(w / 2f, h),
                             strokeWidth = 1.dp.toPx()
                         )
                         drawLine(
-                            color = Color.White.copy(alpha = 0.18f),
+                            color = Color.Black.copy(alpha = 0.18f),
                             start = Offset(0f, h / 2f),
                             end = Offset(w, h / 2f),
                             strokeWidth = 1.dp.toPx()
@@ -16656,7 +18864,7 @@ fun AppleColorPalette(
                             style = Stroke(width = 4.dp.toPx())
                         )
                         drawCircle(
-                            color = Color.White,
+                            color = UiColor.Ink,
                             radius = 9.dp.toPx(),
                             center = Offset(px, py),
                             style = Stroke(width = 2.dp.toPx())
@@ -16664,13 +18872,13 @@ fun AppleColorPalette(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
                 // ── 强度（与色温/色调数值合成一行）──
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         "强度",
-                        color = Color.White.copy(alpha = 0.8f),
+                        color = UiColor.TextDim,
                         fontSize = 12.sp
                     )
                     Spacer(modifier = Modifier.width(8.dp))
@@ -16690,7 +18898,7 @@ fun AppleColorPalette(
                         Canvas(modifier = Modifier.fillMaxSize()) {
                             val y = size.height / 2f
                             drawLine(
-                                color = Color.White.copy(alpha = 0.2f),
+                                color = Color.Black.copy(alpha = 0.2f),
                                 start = Offset(0f, y),
                                 end = Offset(size.width, y),
                                 strokeWidth = 3.dp.toPx(),
@@ -16698,14 +18906,14 @@ fun AppleColorPalette(
                             )
                             val fx = size.width * (intensity / 100f).coerceIn(0f, 1f)
                             drawLine(
-                                color = Color(0xFFFFC107),
+                                color = Color(0xFFFFA000),
                                 start = Offset(0f, y),
                                 end = Offset(fx, y),
                                 strokeWidth = 3.dp.toPx(),
                                 cap = StrokeCap.Round
                             )
                             drawCircle(
-                                color = Color.White,
+                                color = UiColor.Ink,
                                 radius = 7.dp.toPx(),
                                 center = Offset(fx, y)
                             )
@@ -16713,14 +18921,14 @@ fun AppleColorPalette(
                     }
                     Text(
                         "${intensity.roundToInt()}",
-                        color = Color.White,
+                        color = UiColor.Ink,
                         fontSize = 12.sp,
                         modifier = Modifier.width(34.dp),
                         textAlign = TextAlign.End
                     )
                 }
 
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
                 //
                 // ★★影调预设★★
@@ -16751,40 +18959,33 @@ fun AppleColorPalette(
                     Text(
                         "色温 ${if (warmth >= 0) "暖" else "冷"} " +
                                 "${abs(warmth).roundToInt()}",
-                        color = Color.White.copy(alpha = 0.75f),
+                        color = UiColor.TextDim,
                         fontSize = 11.sp
                     )
                     Spacer(modifier = Modifier.width(10.dp))
                     Text(
                         "色调 ${if (tint >= 0) "洋红" else "绿"} " +
                                 "${abs(tint).roundToInt()}",
-                        color = Color.White.copy(alpha = 0.75f),
+                        color = UiColor.TextDim,
                         fontSize = 11.sp
                     )
                     Spacer(modifier = Modifier.weight(1f))
                     Text(
                         "±${TONE_MAX.roundToInt()}",
-                        color = Color.White.copy(alpha = 0.45f),
+                        color = UiColor.TextFaint,
                         fontSize = 10.sp
                     )
                 }
 
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(modifier = Modifier.height(8.dp))
 
                 // 只剩一个"完成"，复位已挪到标题行
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(38.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(
-                            brush = Brush.verticalGradient(
-                                colors = listOf(
-                                    Color(0xFFFFD54F),
-                                    Color(0xFFFFC107)
-                                )
-                            )
-                        )
+                        .clip(RoundedCornerShape(MENU_RADIUS_INNER_DP.dp))
+                        .background(UiColor.Accent)
                         .clickable { onClose() },
                     contentAlignment = Alignment.Center
                 ) {
