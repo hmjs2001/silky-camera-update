@@ -828,7 +828,9 @@ object DeviceCompatibility {
 
     /** 严格意义的华为（荣耀已独立，单独判） */
     val isHuawei: Boolean
-        get() = manufacturer.contains("huawei") || brand.contains("huawei")
+        // 荣耀独立后部分机型 MANUFACTURER 仍残留 "huawei"，不排除的话
+        // 会被当成华为，走错机型档案与切镜头策略（老荣耀尤其明显）。
+        get() = !isHonor && (manufacturer.contains("huawei") || brand.contains("huawei"))
     val isHonor: Boolean
         get() = manufacturer.contains("honor") || brand.contains("honor")
     val isXiaomi: Boolean
@@ -1152,6 +1154,10 @@ object DeviceCompatibility {
      */
     val knownOpticalStops: List<Float>
         get() = when {
+            // 荣耀：按当前生效的机型档案给档位。荣耀 X 系列档案里只有 1x/2x
+            // （确实没有超广角），不硬塞 0.6x；Magic / 数字 / 折叠系列声明了
+            // 0.6x 就保留。用户没选档案时才退回通用三档。
+            isHonor -> ActiveDevice.stops().ifEmpty { listOf(0.6f, 1.0f, 2.0f) }
             isRealmeGT5Pro -> listOf(0.6f, 1.0f, 3.0f)   // 实测 16/23/65mm ≈ 0.7 / 1 / 2.8
             isIQOO10Pro -> listOf(0.6f, 1.0f, 3.0f)      // 实测 15/23/69mm ≈ 0.65 / 1 / 3
             isIQOO15Series -> listOf(0.6f, 1.0f, 3.0f)
@@ -2577,8 +2583,9 @@ object SeriesDb {
             "中高端轻薄影像（50 / 90 / 100 / 200 / 300 / 400）",
             listOf(0.6f, 1f, 2f, 3f), 20f,
             tint = listOf(1.01f, 1.00f, 0.99f),
-            hints = listOf("honor ", "hma", "lge", "ali", "brp"),
-            notes = "长焦多为 2x~3x 直立长焦，逻辑头可切"
+            hints = listOf("honor ", "hma", "lge", "ali", "brp", "nth", "hnnth"),
+            notes = "长焦多为 2x~3x 直立长焦，逻辑头可切；" +
+                    "NTH-AN00 / HNNTH（荣耀 70）超广角只挂在 logical 的 physicalCameraIds 下"
         ),
         profile(
             BrandKey.HONOR, "honor_x", "荣耀 X 系列",
@@ -2858,9 +2865,15 @@ object SeriesDb {
         val deviceL = Build.DEVICE.lowercase()
         val text = "$brandL $manuL $modelL $deviceL"
 
-        val brand = BrandKey.values().firstOrNull { key ->
-            key != BrandKey.OTHER && key.keywords.any { text.contains(it) }
-        } ?: return null
+        // 荣耀优先：部分荣耀机 MANUFACTURER 仍是 "huawei"，而 HUAWEI 枚举排在
+        // HONOR 前面，直接 firstOrNull 会把荣耀判成华为。先钉死品牌再选系列。
+        val brand = if (text.contains("honor")) {
+            BrandKey.HONOR
+        } else {
+            BrandKey.values().firstOrNull { key ->
+                key != BrandKey.OTHER && key.keywords.any { text.contains(it) }
+            } ?: return null
+        }
 
         val pool = byBrand(brand)
         return pool.firstOrNull { p ->
@@ -8050,6 +8063,63 @@ private val ZOOM_EASE_LEGACY_APPLE: Easing = CubicBezierEasing(0.22f, 0.86f, 0.0
 private val SYMMETRIC_ZOOM_EASE: Easing = ZOOM_EASE_LEGACY_APPLE
 
 /**
+ * ★老旧机型卡顿优化★
+ *
+ * 只用系统公开信息判一次并缓存到进程内，不引第三方库、不读隐藏 API：
+ *   · ActivityManager.isLowRamDevice()
+ *   · ActivityManager.MemoryInfo.totalMem
+ *   · Runtime.availableProcessors()
+ *   · Build.VERSION.SDK_INT
+ *
+ * 命中条件收得比较窄：低 RAM 设备直接算；否则「Android 10 及以下 + 少核心/小内存」
+ * 或「少核心且小内存」才算。新机、旗舰、大内存机型一律走原来的高档参数。
+ *
+ * 降频只改三处高频动作，不动相机绑定、预览、拍照、录像任何业务逻辑：
+ *   ① 常驻倍率回读 50ms → 150ms（录制中仍 250ms）
+ *   ② 变焦 HAL 下发 16ms → 32ms
+ *   ③ 变焦 UI 重组节流 72ms → 120ms
+ * 另外 onCreate 里不再强制请求 90/120/144Hz，避免弱 GPU 被高刷拖垮。
+ */
+private object LowEndPolicy {
+    const val POLL_DELAY_MS = 150L
+    const val ZOOM_STEP_MS = 32L
+    const val UI_REFRESH_MS = 120L
+
+    private const val LOW_MEM_BYTES = 3L * 1024L * 1024L * 1024L
+
+    @Volatile
+    private var cached: Boolean? = null
+
+    @Synchronized
+    fun isLowEnd(context: Context): Boolean {
+        cached?.let { return it }
+        val am = context.getSystemService(Context.ACTIVITY_SERVICE)
+                as? android.app.ActivityManager
+        val lowRam = am?.isLowRamDevice == true
+        val memInfo = android.app.ActivityManager.MemoryInfo()
+        try {
+            am?.getMemoryInfo(memInfo)
+        } catch (e: Exception) {
+            // 个别 ROM 这里会抛异常，按「内存未知」处理即可，不能影响启动
+        }
+        val totalMem = memInfo.totalMem
+        val cores = Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
+        val oldApi = Build.VERSION.SDK_INT <= 29
+        val lowMem = totalMem > 0L && totalMem <= LOW_MEM_BYTES
+        val lowCore = cores <= 4
+
+        val value = lowRam || (oldApi && (lowMem || lowCore)) || (lowMem && lowCore)
+        cached = value
+        Log.d(
+            "SilkyCamera",
+            "低配策略：$value（lowRam=$lowRam, api=${Build.VERSION.SDK_INT}, " +
+                    "cores=$cores, mem=${totalMem / (1024L * 1024L)}MB）"
+        )
+        return value
+    }
+}
+
+/**
  * 点变焦档位按钮（切换焦段）的动画时长基准(ms)。
  * ★整体调慢★：从原文档的 720f 提到 900f（+25%）。
  * 手感目标不变：前段冲得快、后段明显慢下来收尾，只是全程更从容一点。
@@ -8188,11 +8258,11 @@ private const val DRAG_ZOOM_THROTTLE_REC_MS = 150L
  *    否则"已是最新版"的判断会反过来，每次启动都提示更新（见 AboutScreen 里的说明）。
  * 发新版时改这两处，并且【记得同步 app/build.gradle 里的 versionName / versionCode】。
  */
-private const val APP_VERSION_NAME = "v3.2.8"
-/** ★发版递增★：11→12。协议钥匙 = versionCode:POLICY_REVISION，
+private const val APP_VERSION_NAME = "v3.2.9"
+/** ★发版递增★：12→13。协议钥匙 = versionCode:POLICY_REVISION，
  *  只有它变了，覆盖安装后才会像新版本一样重新弹用户协议；
  *  更新检测也以 gradle 的 versionCode 为准，务必同步 app/build.gradle(.kts)。 */
-private const val APP_VERSION_CODE = 12
+private const val APP_VERSION_CODE = 13
 
 /**
  * ★应用显示名★
@@ -8703,7 +8773,13 @@ class MainActivity : ComponentActivity() {
         // 只挑 refreshRate 最高的那个 mode，不改分辨率、不动相机预览参数。
         // 设置界面（以及关于页）的长列表滚动受益最明显。
         //
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        // ★老旧机型卡顿优化★：低 RAM / 少核心设备不再强制最高刷新率。
+        // 老机器 GPU 与内存带宽本就吃紧，相机预览 + Compose 再叠 120Hz
+        // 容易掉帧；让系统用默认刷新率更稳。新机保持原逻辑不变。
+        //
+        if (!LowEndPolicy.isLowEnd(this) &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+        ) {
             @Suppress("DEPRECATION")
             val display = windowManager.defaultDisplay
             val best = display.supportedModes.maxByOrNull { it.refreshRate }
@@ -8750,6 +8826,8 @@ fun CameraApp() {
     val lifecycleOwner = LocalLifecycleOwner.current
     val haptic = LocalHapticFeedback.current
     val coroutineScope = rememberCoroutineScope()
+    // ★老旧机型卡顿优化★：只算一次，Compose 重组不会反复读系统服务
+    val lowEndDevice = remember(context) { LowEndPolicy.isLowEnd(context) }
 
     // 横竖屏。横屏时变焦控件和模式栏要挪到屏幕两边，别糊在取景框正中间
     val configuration = LocalConfiguration.current
@@ -8862,6 +8940,8 @@ fun CameraApp() {
      * 广角头出不了画面不代表长焦头也不行，不该一刀切把两条路都封死。
      */
     var physicalWideWorks by remember { mutableStateOf(true) }
+    /** 荣耀广角：用户主动点 0.6x 时允许重置被封禁的物理广角路径，最多 3 次 */
+    var honorWideRetry by remember { mutableIntStateOf(0) }
     // 真实可绑定的物理头列表（由 probePhysicalCameras 独立扫描，保证是真 id）
     var physicalLensOptions by remember {
         mutableStateOf<List<DeviceCompatibility.LensProfile>>(emptyList())
@@ -9267,6 +9347,15 @@ fun CameraApp() {
     // vivo 适配：变焦范围改成从 zoomState 实时读，不再写死 0.6x~10x。
     // X80 Pro 的 0.6x 超广角 / 5x 潜望能不能被 HAL 正常上报因机而异，读出来才准。
     var minZoomRatio by remember { mutableFloatStateOf(0.6f) }
+    /**
+     * ★HAL 原生上报的变焦下限★（未被任何兜底放宽过）。
+     * >= 0.99 且物理头池里也没有广角头 = 厂商没把 <1x 交给第三方，
+     * App 层无论怎么放宽 coerceIn / 切头 / 换会话都到不了超广角。
+     * 用于产品层收尾：别再让用户对着一个点了静默跳回 1x 的按钮。
+     */
+    var halReportedMin by remember { mutableFloatStateOf(1.0f) }
+    /** 超广角锁定提示的节流，避免连点刷 Toast */
+    var lastWideLockedToastMs by remember { mutableLongStateOf(0L) }
     /** HAL 原生上报的变焦上限（不含本次新增的"扩展数码变焦"部分） */
     var halMaxZoomRatio by remember { mutableFloatStateOf(10.0f) }
     var maxZoomRatio by remember { mutableFloatStateOf(10.0f) }
@@ -9585,21 +9674,69 @@ fun CameraApp() {
     }
 
     /**
+     * ★★厂商是否锁死了超广角★★（B 方案的唯一判据，运行时事实，不猜机型）
+     *
+     * 三条同时成立才算：
+     *   · 后摄（前摄本来就不该有 0.6x）
+     *   · HAL【原生】下限 >= 0.99 —— 系统只把 1x 起的范围交给第三方。
+     *     ⚠️ 必须用 halReportedMin 而不是 minZoomRatio：后者被前面的荣耀兜底
+     *        无条件放宽到 0.6 了，拿它判断会永远得出"没锁死"。
+     *   · 物理头池里没有 0.2~0.95 的广角头 —— 连重新绑定 /
+     *     PHYSICAL_CAMERA_ID 直切都没得切。
+     *
+     * 三个标准 API 路径（放宽夹取 / 切物理头 / CameraX Extensions）都试过无效，
+     * 到这里就是厂商策略限制，App 层到此为止。
+     */
+    fun wideLockedByVendor(): Boolean =
+        !isFront && halReportedMin >= 0.99f &&
+                physicalLensOptions.none {
+                    DeviceCompatibility.isRealCameraId(it.id) &&
+                            it.zoomFactor in 0.2f..0.95f
+                }
+
+    /**
+     * 任何入口（档位按钮 / 拖动标尺 / 手势）试图去 <1x 时，给一次明确说明，
+     * 不再静默把 0.6 夹回 1x 让用户以为软件坏了。返回 true = 已拦截，调用方直接 return。
+     */
+    fun showWideLockedHintIfNeeded(zoom: Float): Boolean {
+        if (!wideLockedByVendor()) return false
+        val now = System.currentTimeMillis()
+        if (now - lastWideLockedToastMs > 2000L) {
+            lastWideLockedToastMs = now
+            android.widget.Toast.makeText(
+                context,
+                "该机型系统未向第三方应用开放超广角，请用系统相机拍摄 0.6x",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+        }
+        Log.w("Camera", "超广角被厂商锁定：HAL 原生下限 " +
+                "${"%.2f".format(halReportedMin)}x，物理头池无广角头，忽略 ${"%.2f".format(zoom)}x")
+        return true
+    }
+
+    /**
      * ★4K60 下实际展示的变焦档位★
      * 只留落在当前区间内的原厂档，并【补齐区间两端】，保证：
      *   · 开录前（1~15x）一定有 1x 和 15x
      *   · 录制中主摄（1~6x）一定有 1x 和 6x
      *   · 录制中长焦（5~15x）一定有 5x 和 15x
      * 非 4K60 时原封不动返回 zoomStops。
+     *
+     * ★B 方案★：厂商锁死超广角时，把 <1x 的档位整个从列表里拿掉 ——
+     * 界面上根本不出现那个「点了只跳回 1x」的假按钮。档位按钮与横屏轮盘
+     * 都走这个函数（横屏非 4K60 分支另在 15479 行同步处理）。
      */
     fun displayZoomStops(): List<Float> {
-        if (!wideBannedFor4K60()) return zoomStops
-        val lo: Float = effMinZoom()
-        val hi: Float = effMaxZoom()
-        val inRange: List<Float> = zoomStops.filter {
-            it >= lo - 0.01f && it <= hi + 0.01f
+        val stops: List<Float> = if (!wideBannedFor4K60()) zoomStops
+        else {
+            val lo: Float = effMinZoom()
+            val hi: Float = effMaxZoom()
+            val inRange: List<Float> = zoomStops.filter {
+                it >= lo - 0.01f && it <= hi + 0.01f
+            }
+            (inRange + listOf(lo, hi)).distinct().sorted()
         }
-        return (inRange + listOf(lo, hi)).distinct().sorted()
+        return if (wideLockedByVendor()) stops.filter { it >= 0.99f } else stops
     }
 
     /**
@@ -9644,11 +9781,27 @@ fun CameraApp() {
         //    不在 cameraIdList 里的头（ColorOS 常见）。这种头 CameraX 的 CameraFilter
         //    根本匹配不到，绑它必然失败 → 广角被判定"物理直连不可用"并永久封禁
         //    → 0.6x 从此彻底用不了。
-        val real = physicalLensOptions.filter {
-            DeviceCompatibility.isRealCameraId(it.id) && DeviceCompatibility.canBindDirectly(it.id)
+        val all = physicalLensOptions.filter { DeviceCompatibility.isRealCameraId(it.id) }
+        val bindable = all.filter { DeviceCompatibility.canBindDirectly(it.id) }
+        // 行注释：NTH-AN00（荣耀 70 / MagicOS 8）实测修复。
+        // 荣耀常把超广角只挂在逻辑头的 physicalCameraIds 下，它不在 cameraIdList 里，
+        // canBindDirectly=false。原版只从 bindable 里挑 → 广角头永远挑不中 →
+        // requestLensSwitchIfNeeded 在 9916 行直接 return false，0.6x 彻底出不来。
+        // 与 pickTeleFor 对称补一层：可独立打开的池里没有广角时，把能用
+        // CaptureRequest.PHYSICAL_CAMERA_ID 切的那颗广角也纳入候选。
+        // 下发阶段 10049 行已有 USE_PHYSICAL_REQUEST_SWITCH 分支接住，
+        // 不会去 bindToLifecycle 一个绑不上的 id。已适配机型 bindable 里本来就有
+        // 广角头，这一层不生效，行为完全不变。
+        val hasBindableWideHere = bindable.any { it.zoomFactor in 0.2f..0.95f }
+        val switchableWide = if (hasBindableWideHere) emptyList()
+        else all.filter {
+            !DeviceCompatibility.canBindDirectly(it.id) &&
+                    DeviceCompatibility.isSwitchableViaRequest(it.id) &&
+                    it.zoomFactor in 0.2f..0.95f
         }
+        val merged = bindable + switchableWide
         val pool: List<DeviceCompatibility.LensProfile> =
-            if (real.isNotEmpty()) real
+            if (merged.isNotEmpty()) merged
             else lensProfiles.filter { DeviceCompatibility.isRealCameraId(it.id) }
         if (pool.isEmpty()) return null
         return pool.filter { it.zoomFactor <= global + 0.001f }
@@ -9925,8 +10078,15 @@ fun CameraApp() {
             //   ① 绑定时读到 HAL 原生下限 >= 1.0，但本机确实有 <1.0 的光学档
             //   ② 变焦校验发现目标 0.6x 实际回读是 1.0x
             // 没坐实之前一律不直连 —— 否则会抢掉本来能正常工作的 setZoomRatio。
-            boundLensId == null && logicWideBlocked && physicalWideWorks &&
-                    target < 0.99f && !wideBannedFor4K60() -> !sameLens
+            // ★NTH-AN00★：logicWideBlocked 依赖「探测到广角物理头」，
+            // 荣耀不暴露副摄时它恒为 false → 这里直接放行不了切头。
+            // 改用「已放宽到广角下限」作为荣耀的独立判据：
+            // minRatio < 0.95 只可能是上面②③放宽出来的（荣耀 X 系列无广角仍是 1.0）。
+            boundLensId == null &&
+                    (logicWideBlocked ||
+                            (DeviceCompatibility.isHonor && target < 0.99f && minRatio < 0.95f)) &&
+                    physicalWideWorks && target < 0.99f &&
+                    !wideBannedFor4K60() -> !sameLens
 
             // ★长焦走物理直连★：不管当前在哪颗头上（逻辑头 / 广角头 / 另一颗长焦头）
             // ⚠️ 这里原来写的是 `boundLensId == null && tele != null`，只在【逻辑头】上才生效。
@@ -11781,6 +11941,9 @@ fun CameraApp() {
             camera?.cameraInfo?.zoomState?.value?.let { zs ->
                 val (mn, mx) = normalizeZoomRange(zs.minZoomRatio, zs.maxZoomRatio)
                 if (boundLensId == null) {
+                    // ★先记下 HAL 原生值★（下面会按光学档放宽 minZoomRatio，
+                    // 放宽后的值不能用来判断厂商有没有锁死超广角）
+                    halReportedMin = mn
                     // 逻辑摄像头：它上报的就是全局范围。
                     //
                     // ★HAL 谎报下限★ 小米 / iQOO 的逻辑头常把 minZoomRatio 报成 1.0，
@@ -11793,8 +11956,22 @@ fun CameraApp() {
                         .filter { DeviceCompatibility.isRealCameraId(it.id) }
                         .filter { it.zoomFactor in 0.2f..0.95f }
                         .minByOrNull { it.zoomFactor }?.zoomFactor
+                    // 荣耀兜底：HAL 报 min=1.0 max=1.0，副摄又常不在 cameraIdList 里，
+                    // opticalStops / realWide 都可能没有更广的档，用出厂档位补 0.6x 下限。
+                    // 用 knownOpticalStops 而不是 ActiveDevice.stops()：用户没在
+                    // 「机型与色彩」里选过档案时 profile=null，stops() 返回空列表，
+                    // 上一版这里就拿不到 0.6，下限照样被 clamp 回 1.0。
+                    // ★NTH-AN00 实测★：这台荣耀探测结果里根本没有 <0.95 的档位，
+                    // 上一版靠 knownOpticalStops 取兜底值会得到 null → finalMin=mn=1.0
+                    // → 后面 coerceIn(effMinZoom(), ...) 把点 0.6x 夹成 1.0x，
+                    // 这就是「按钮在、点了只能到 1x」的直接原因。
+                    // 荣耀数字系列出厂就有 0.6x 超广角，HAL 谎报下限时无条件补 0.6。
+                    val profileWide: Float? = if (DeviceCompatibility.isHonor && mn >= 0.99f)
+                        (DeviceCompatibility.knownOpticalStops
+                            .filter { it in 0.2f..0.95f }.minOrNull() ?: 0.6f)
+                    else null
                     val opticalMin: Float? = listOfNotNull(
-                        opticalStops.filter { it > 0f }.minOrNull(), realWide
+                        opticalStops.filter { it > 0f }.minOrNull(), realWide, profileWide
                     ).minOrNull()
                     val finalMin: Float =
                         if (opticalMin != null && opticalMin < mn - 0.01f) opticalMin else mn
@@ -11809,31 +11986,37 @@ fun CameraApp() {
                     maxZoomRatio = zoomCapFor(mx)
 
                     // ★检测"HAL 撒谎"★
-                    // mn 是 HAL 原生上报的下限。它 >= 1.0 说明逻辑头根本不接受 <1.0 的倍率，
-                    // 但本机光学档位里确实有 0.6x —— 那这个广角只能靠物理直连才拿得到。
-                    val hasWideOptic: Boolean = opticalStops.any { it < 0.95f }
-                    // ★本机是否真有一颗"能独立打开"的广角头★
-                    // 光"存在广角"不够：它必须在 cameraIdList 里，否则 CameraX 绑不上。
+                    // mn 是 HAL 原生上限的下限。>= 1.0 说明逻辑头不接受 <1.0 的倍率，
+                    // 但本机确实有 0.6x 光学档 —— 只能靠切物理头拿得到。
+                    // 荣耀补一层：探测只报主摄 + 景深时 opticalStops 里没有 <0.95 的档，
+                    // 但出厂档案声明了 0.6x（NTH-AN00 就是这种情况），照样要认定有广角。
+                    val hasWideOptic: Boolean = opticalStops.any { it < 0.95f } ||
+                            (DeviceCompatibility.isHonor &&
+                                    DeviceCompatibility.knownOpticalStops.any { it < 0.95f })
+                    // ★本机是否真有一颗「能切过去」的广角头★
+                    // 两条路都算可用：
+                    //   ① 在 cameraIdList 里 → 重新绑定（老路）
+                    //   ② 挂在逻辑头 physicalCameraIds 下 → CaptureRequest.PHYSICAL_CAMERA_ID
+                    // 荣耀 MagicOS / ColorOS 常走 ②。上一版只认 ①，于是
+                    // NTH-AN00 被判成「没有广角头」，反而把切头路径整个堵死了。
                     val hasBindableWide: Boolean = physicalLensOptions.any {
                         DeviceCompatibility.isRealCameraId(it.id) &&
-                                DeviceCompatibility.canBindDirectly(it.id) &&
+                                (DeviceCompatibility.canBindDirectly(it.id) ||
+                                        DeviceCompatibility.isSwitchableViaRequest(it.id)) &&
                                 it.zoomFactor in 0.2f..0.95f
                     }
-                    // ★红米 Note 数字系列 / OPPO Find★：实测逻辑头 setZoomRatio(0.6) 完全无效，
-                    // 直接判定"广角必须走物理直连"，省掉一次注定失败的下发 + 校验。
-                    //
-                    // ⚠️ 但只有在【真的有可直连的广角头】时才这么判：
-                    //    Find X7 逻辑头下限是 0.7x（本身就是超广角在工作），
-                    //    而超广角物理头不在 cameraIdList 里绑不上 ——
-                    //    强制走物理直连只会失败并永久封禁，0.6x 反而彻底用不了。
-                    //    这种情况就该让逻辑头接手（能到 0.7x，已经是最广）。
-                    val blocked: Boolean = hasWideOptic &&
-                            (mn >= 0.99f ||
-                                    (DeviceCompatibility.preferPhysicalWide && hasBindableWide))
+                    // ★红米 Note 数字系列 / OPPO Find / 荣耀★：逻辑头 setZoomRatio(0.6)
+                    // 完全无效，判定「广角必须切物理头」，省掉一次注定失败的下发 + 校验。
+                    // 前提必须有【真的能切过去的广角头】：一颗都没有时强制切头只会
+                    // 反复失败、把 physicalWideWorks 永久关掉，0.6x 反而彻底用不了。
+                    // Find X7 逻辑头下限 0.7x（本身就是最广）、广角头也切不过去时，
+                    // 就交给逻辑头接手，不再抢。
+                    val blocked: Boolean = hasWideOptic && hasBindableWide &&
+                            (mn >= 0.99f || DeviceCompatibility.preferPhysicalWide)
                     if (DeviceCompatibility.preferPhysicalWide && !hasBindableWide && mn < 0.99f) {
                         Log.w(
                             "Camera",
-                            "本机标记为'广角需物理直连'，但没有可独立打开的广角头，" +
+                            "本机标记为'广角需物理直连'，但没有可切过去的广角头，" +
                                     "改由逻辑摄像头承担（下限 ${mn}x）"
                         )
                     }
@@ -12181,7 +12364,18 @@ fun CameraApp() {
                     // 物理头直连时不能刷新 —— 那只是这颗头内部的局部范围。
                     if (boundLensId == null) {
                         val (mn, mx) = normalizeZoomRange(it.minZoomRatio, it.maxZoomRatio)
-                        if (mn != minZoomRatio) minZoomRatio = mn
+                        if (mn != minZoomRatio) {
+                            // 荣耀适配：HAL 每帧都把 minZoomRatio 报成 1.0，若这里无条件
+                            // 写回，前面按光学档放宽好的 0.6x 下限会被瞬间打回 1.0，
+                            // 广角就永远调不出来。只在档案声明有超广角档时保留放宽值。
+                            val honorFloor: Float? = if (DeviceCompatibility.isHonor && mn >= 0.99f)
+                                (DeviceCompatibility.knownOpticalStops
+                                    .filter { it in 0.2f..0.95f }.minOrNull() ?: 0.6f)
+                            else null
+                            minZoomRatio = if (honorFloor != null && mn >= 0.99f)
+                                minOf(minZoomRatio, honorFloor)
+                            else mn
+                        }
                         if (mx != halMaxZoomRatio) {
                             halMaxZoomRatio = mx
                             maxZoomRatio = zoomCapFor(mx)
@@ -12225,8 +12419,14 @@ fun CameraApp() {
             // ★录制中降频★：50ms → 250ms。
             //   录制时变焦是偶发操作，没必要用待机时的高频回读去换精度，
             //   省下来的 15 次/秒重组直接还给编码器。
+            // ★老旧机型卡顿优化★：低配待机回读 50ms → 150ms，
+            //   减少约 2/3 的 zoomState 读取与潜在状态写入；录制仍保持 250ms。
             //
-            delay(if (isRecording) 250L else 50L)
+            delay(
+                if (isRecording) 250L
+                else if (lowEndDevice) LowEndPolicy.POLL_DELAY_MS
+                else 50L
+            )
         }
     }
 
@@ -12390,8 +12590,26 @@ fun CameraApp() {
         // 只有在【实测坐实】逻辑头到不了广角时才换物理头。
         // ⚠️ 这里曾经无条件调用 requestLensSwitchIfNeeded，等于每次变焦都先尝试直连，
         //    结果把本来 setZoomRatio 能正常工作的机型搞坏了。现在严格限定条件。
-        val wantWide = logicWideBlocked && physicalWideWorks &&
+        // ★NTH-AN00★：原条件要求 logicWideBlocked（依赖探测到广角物理头），
+        // 荣耀不暴露副摄时 wantWide 恒为 false → 压根不调用 requestLensSwitchIfNeeded，
+        // 只走 setZoomRatio(0.6)，被 CameraX 按 zoomState.minZoomRatio=1.0 夹回 1x。
+        val honorWideAttempt: Boolean = DeviceCompatibility.isHonor &&
+                targetRatio < 0.99f && minRatio < 0.95f
+        // 广角头只要失败过一次 physicalWideWorks 就被置 false，同一会话里之后
+        // 再点 0.6x 也永远不再尝试。用户主动点广角时给最多 3 次重试机会。
+        if (honorWideAttempt && !physicalWideWorks && honorWideRetry < 3) {
+            honorWideRetry++
+            physicalWideWorks = true
+            Log.w("Camera", "荣耀广角：用户主动点 " +
+                    "${"%.2f".format(targetRatio)}x，重置物理广角路径（第 $honorWideRetry 次）")
+        }
+        val wantWide = (logicWideBlocked || honorWideAttempt) && physicalWideWorks &&
                 targetRatio < 0.99f && !wideBannedFor4K60()
+        if (honorWideAttempt) {
+            Log.d("Camera", "荣耀广角尝试：wantWide=$wantWide " +
+                    "logicWideBlocked=$logicWideBlocked physicalWideWorks=$physicalWideWorks " +
+                    "minRatio=${"%.2f".format(minRatio)}x 目标=${"%.2f".format(targetRatio)}x")
+        }
         // 统一用 pickTeleFor（容差与 requestLensSwitchIfNeeded 完全一致，避免两边判定打架）
         val teleForTarget: DeviceCompatibility.LensProfile? = pickTeleFor(targetRatio)
         //
@@ -12551,6 +12769,8 @@ fun CameraApp() {
                     .coerceAtMost(ZOOM_ANIM_BASE_MS * ZOOM_SHORT_FOCAL_SLOWDOWN)
                     .toLong()
                 val stepMs: Long = when {
+                    // ★老旧机型卡顿优化★：步数减半，给 HAL / 主线程留出余量
+                    lowEndDevice -> LowEndPolicy.ZOOM_STEP_MS
                     isRecording -> ZOOM_ANIM_STEP_MS_REC
                     // OPPO / 一加 / realme 同宗 ColorOS HAL，回缩时再宽一档
                     boostRetrace && DeviceCompatibility.isOppo -> ZOOM_ANIM_STEP_MS_RETRACE_OPPO
@@ -12578,6 +12798,9 @@ fun CameraApp() {
                 // ★回缩段把 UI 提交节流也放宽★：displayedRatio 每写一次
                 // 就重组整棵 CameraApp，这是原注释里"变焦卡顿的元凶"。
                 val uiThrottle: Long = when {
+                    // ★老旧机型卡顿优化★：displayedRatio 写一次就重组整棵 CameraApp，
+                    // 老机型把 UI 刷新从 ~14fps 再降到 ~8fps，肉眼仍够用
+                    lowEndDevice -> LowEndPolicy.UI_REFRESH_MS
                     isRecording -> ZOOM_UI_REFRESH_MS_REC
                     boostRetrace -> ZOOM_UI_REFRESH_MS_RETRACE
                     else -> ZOOM_UI_REFRESH_MS
@@ -12749,6 +12972,9 @@ fun CameraApp() {
     fun onZoomButtonClick(zoom: Float) {
         // 2x 再点一下切 3.5x：这是原厂 App 常见的"人像/长焦中间档"手感，
         // 但如果本机根本没有这个焦段的物理头，就直接吸附回最近的光学档
+        // ★★B 方案★：按钮已隐藏，这里只对「万一从别的入口点进来」兜底，
+        // 给明确说明而不是静默夹回 1x。判据统一走 wideLockedByVendor()。
+        if (zoom < 0.99f && showWideLockedHintIfNeeded(zoom)) return
         // ★中间档也用整数★：原来这里写死 3.5x，跟"一律整数焦段"的要求冲突
         val target: Float = if (zoom == 2.0f && abs(selectedZoom - 2.0f) < 0.05f) {
             snapToOptical(3.0f)
@@ -12763,6 +12989,8 @@ fun CameraApp() {
     fun commitZoom(ratio: Float) {
         val cam = camera ?: return
         if (!scanDone) return
+        // ★B 方案★：按钮隐藏后，用户仍可能拖动标尺到 <1x，这里同样给说明
+        if (ratio < 0.99f && showWideLockedHintIfNeeded(ratio)) return
         val snapped = snapToOptical(ratio)
         // 长焦档即使"没发生吸附"也要走一次 smoothZoomTo，否则换头逻辑永远不触发
         val teleForSnap: DeviceCompatibility.LensProfile? = pickTeleFor(snapped)
@@ -15353,7 +15581,9 @@ fun CameraApp() {
                                     // 横屏竖向空间够放 6 个，就把 10x 补上。
                                     val landscapeStops = remember(
                                         zoomStops, opticalStops, maxRatio,
-                                        lensLock4K60Tele, videoQuality, videoFrameRate
+                                        lensLock4K60Tele, videoQuality, videoFrameRate,
+                                        // ★B 方案★：判据变了要重算，否则横屏仍画着 0.6x
+                                        halReportedMin, physicalLensOptions
                                     ) {
                                         if (wideBannedFor4K60()) {
                                             // ★4K60★：直接用锁定区间的档位（含补齐的两端）
@@ -15367,6 +15597,8 @@ fun CameraApp() {
                                             val ten = listOf(10.0f).filter { it <= maxRatio + 0.01f }
                                             (optical + extras + ten)
                                                 .distinct()
+                                                // ★B 方案★：厂商锁死时不画 <1x 档
+                                                .filter { !wideLockedByVendor() || it >= 0.99f }
                                                 .sortedDescending()
                                                 .take(6)
                                                 .ifEmpty { zoomStops.sortedDescending().take(6) }
@@ -16523,6 +16755,8 @@ fun AboutScreen(
     val haptic = LocalHapticFeedback.current
     /** ★关于页里的「用户协议」只读全文★（与首次启动那道门共用同一份正文） */
     var showAgreement by remember { mutableStateOf(false) }
+    /** ★问题反馈弹窗开关★（反馈模块见 Feedback.kt） */
+    var showFeedback by remember { mutableStateOf(false) }
     // 排查"最新版还弹更新"时看这一行：它必须 >= update.json 里的 versionCode
     val context = LocalContext.current
     Box(
@@ -16530,6 +16764,14 @@ fun AboutScreen(
             .fillMaxSize()
             .background(UiColor.Surface)
     ) {
+        // ★问题反馈弹窗★：Compose Dialog 是独立 Window，放在这里不占布局空间
+        if (showFeedback) {
+            FeedbackDialog(
+                onClose = { showFeedback = false },
+                appVersionName = APP_VERSION_NAME,
+                appVersionCode = AppUpdate.currentVersionCode(context)
+            )
+        }
         Column(modifier = Modifier.fillMaxSize()) {
             Row(
                 modifier = Modifier
@@ -16675,6 +16917,11 @@ fun AboutScreen(
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     OssLicenseEntry(onOpen = onOpenOssLicense)
+
+                    // ── ★问题反馈：一级入口（与用户协议同级）★ ──
+                    // 点击打开 FeedbackDialog，提交到 silkycamera.cc.cd 后台。
+                    Spacer(modifier = Modifier.height(12.dp))
+                    FeedbackEntryRow(onClick = { showFeedback = true })
 
                     // ── ★用户协议：放在关于卡片【最下面】★ ──
                     // 与首次启动 / 版本更新时那道「必须同意」的门共用同一份正文
